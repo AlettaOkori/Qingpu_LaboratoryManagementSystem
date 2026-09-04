@@ -36,7 +36,7 @@ const experimentFixtures = {
 };
 function planItemInput(key, overrides = {}) { return { ...experimentFixtures[key], scheduleType: "WEEK", plannedWeek: 3, plannedDate: "", ...overrides }; }
 function createPhysicsBooking(f, overrides = {}) {
-  const { classId = "S1-C2", planItemId = "S1-P1-I1", personId = "S1-T1", ...input } = overrides;
+  const { classId = "S1-C2", planItemId = "S1-P1-I1", personId, ...input } = overrides;
   const task = physicalTask(f.db, classId, planItemId);
   assert.ok(task, "physics teaching task must exist");
   return f.run("teacher", "booking.create", {
@@ -47,7 +47,7 @@ function createPhysicsBooking(f, overrides = {}) {
     requestedResources: [],
     note: "测试预约",
     ...input
-  }, personId);
+  }, personId || task.teacherId);
 }
 function createPhysicalStock(f) {
   const stock = f.run("admin", "inventory.save", {
@@ -73,14 +73,14 @@ function arrange(f, bookingId, overrides = {}) {
     scheduledDate: M.TODAY,
     startPeriod: 2,
     endPeriod: 2,
-    technicianId: "S1-T4",
+    technicianId: "S1-T0",
     resources: [],
     note: "按课表安排",
     ...overrides
   });
 }
 
-test("v9样例不再保存旧计划、预约、班级和存放字段", () => {
+test("v12样例接入橱柜并不再保存旧计划、预约和班级字段", () => {
   const db = M.seed();
   assert.equal(db.version, M.VERSION);
   assert.equal(M.roles.technician, undefined, "实验员不再作为独立角色");
@@ -90,13 +90,22 @@ test("v9样例不再保存旧计划、预约、班级和存放字段", () => {
   for (const school of db.schools) assert.equal(Object.hasOwn(school, "street"), false, "schools.street");
   for (const plan of db.plans) for (const key of ["classId", "teacherId", "catalogId", "date", "week", "mode", "revisionNo"]) assert.equal(Object.hasOwn(plan, key), false, `plans.${key}`);
   for (const item of db.planItems) { assert.equal(Object.hasOwn(item, "sortNo"), false, "planItems.sortNo"); assert.ok(item.experimentName && item.chapter && item.equipment && item.periods >= 1, "计划明细直接保存实验业务字段"); }
-  assert.equal(db.catalog, undefined, "当前模型移除独立实验目录");
+  assert.ok(Array.isArray(db.experimentCatalog), "当前模型保留教材实验目录");
+  assert.ok(Array.isArray(db.textbooks), "当前模型保留教材关系");
+  assert.ok(Array.isArray(db.customExperiments), "当前模型保留学校自定义创新实验");
+  assert.ok(Array.isArray(db.planTargets), "当前模型保留计划适用班级");
+  assert.deepEqual([...new Set(db.classes.filter(row => row.school === "S1").map(row => row.grade))], ["高一", "高二", "高三"], "编制计划的适用年级应至少覆盖高中三个年级");
+  assert.ok(db.textbooks.some(row => row.subject === "物理" && row.grade === "高二"), "高二教材应可供切换");
+  assert.ok(db.experimentCatalog.some(row => row.subject === "物理" && row.grade === "高三"), "高三教材实验目录应可供切换");
+  assert.ok(db.plans.every(plan => plan.name === `${db.terms.find(term => term.id === plan.term)?.name} · ${plan.grade}${M.subjectLabel(plan.subject)}实验计划`), "样例计划名称应与四学科编制计划默认格式一致");
   assert.equal(db.itemCatalog, undefined, "当前模型取消独立物品目录");
   assert.equal(db.moves, undefined, "当前模型取消调拨记录");
   assert.equal(db.loans, undefined, "当前模型取消借还记录");
   assert.ok(db.rooms.every(room => typeof room.hazardStorage === "boolean"));
   assert.equal(get(db, "rooms", "S1-L2").hazardStorage, true);
   assert.equal(get(db, "rooms", "S1-L1").hazardStorage, false);
+  assert.equal(db.cabinets.length, 12, "每校演示库提供房间内橱柜");
+  assert.ok(db.assets.some(row => row.cabinetId) && db.inventory.some(row => row.cabinetId), "设备和库存示例带有柜位");
   for (const klass of db.classes) assert.equal(Object.hasOwn(klass, "teacherIds"), false, "classes.teacherIds");
   for (const booking of db.bookings) for (const key of ["planId", "labId", "managerId", "date", "start", "end", "period", "resources"]) assert.equal(Object.hasOwn(booking, key), false, `bookings.${key}`);
   assert.ok(db.bookings.every(booking => booking.requestedResources.every(resource => resource.itemId && resource.name && !Object.hasOwn(resource, "ref"))), "预约需求直接保存物品类型信息，不提前锁定资产或库存余额");
@@ -107,30 +116,108 @@ test("v9样例不再保存旧计划、预约、班级和存放字段", () => {
     assert.ok(M.itemOf(db, row));
   }
   assert.ok(db.inventory.every(row => !Object.hasOwn(row, "opening")));
+  assert.ok(db.inventory.every(row => Object.hasOwn(row, "unitPrice") && Object.hasOwn(row, "purchaseDate")), "易耗品账目保留分类账所需单价和购置日期");
+  for (const row of db.repairs) for (const key of ["state", "due", "decision", "acceptance", "priorState", "startedAt"]) assert.equal(Object.hasOwn(row, key), false, `repairs.${key}`);
+  for (const row of db.flows.filter(flow => flow.kind === "损耗")) for (const key of ["state", "reviewer", "reviewNote", "arrangementId", "taskId"]) assert.equal(Object.hasOwn(row, key), false, `loss.${key}`);
   assert.equal(M.extendedImportHeader, undefined);
   const source = fs.readFileSync(path.join(__dirname, "../assets/app.js"), "utf8");
+  const subjectContextDeclaration = source.slice(source.indexOf("const subjectContextPages"), source.indexOf("const subjectContextEnabled"));
+  const planCatalogRefresh = source.slice(source.indexOf("function refreshPlanCatalog"), source.indexOf("function refreshPlanClasses"));
+  const planClassesRefresh = source.slice(source.indexOf("function refreshPlanClasses"), source.indexOf("function readPlanCompileRows"));
   const planForm = source.slice(source.indexOf("function planForm"), source.indexOf("function setOptions"));
   const bookingForm = source.slice(source.indexOf("function bookingForm"), source.indexOf("function planItemEditor"));
-  assert.doesNotMatch(planForm, /field\("(?:term|classId|teacherId|subject)"/);
+  assert.doesNotMatch(planForm, /pf\("(?:classId|teacherId)"/);
+  assert.match(planForm, /pf\("subject"/, "计划编制页须允许确认本计划学科");
+  assert.match(planForm, /pf\("term"[\s\S]*?data-submit-disabled/, "计划编制页学期须由当前上下文带入且只读");
   assert.doesNotMatch(bookingForm, /f\("(?:labId|managerId|start|end)"/);
-  assert.match(planForm, /学校在本表单直接维护实验计划内容/);
   assert.match(source, /function currentPlanSubject\(\)/, "综合教师须从页面上下文选择具体计划学科");
-  assert.doesNotMatch(source, /实验目录|物品目录|catalogId/, "当前页面不再依赖独立目录");
+  assert.doesNotMatch(subjectContextDeclaration, /"safety"/, "跨学科共享的安全模块不应显示伪学科切换");
+  assert.match(source, /defaultPlanName[^\n]*subjectLabel\(subject\)/, "计划默认名称须使用标准学科显示名");
+  assert.match(planCatalogRefresh, /const formEl = \$\("#modalForm"\)/, "切换计划学科时须读取计划弹窗内的字段");
+  assert.match(planCatalogRefresh, /previousTextbook[\s\S]*options\.some\(\(\[id\]\)/, "切换计划学科后教材必须重置为当前学科的有效选项");
+  assert.match(planClassesRefresh, /const formEl = \$\("#modalForm"\)/, "切换计划年级时须读取计划弹窗内的字段");
+  assert.match(source, /教材实验清单|planCatalogRows/, "计划页面按教材清单编制");
+  assert.match(planForm, /name="planClassIds"/, "编制计划须显示适用班级选择");
+  assert.match(planForm, /refreshLatestLocalData\(\)/, "打开编制计划时须读取最新班级数据");
+  assert.match(planForm, /defaultPlanName\(term\.name, grade, subject\)/, "新建计划默认名称应与样例格式一致");
+  assert.doesNotMatch(planForm, /plan-item-add|plan-item-remove|data-plan-item/, "编制页不再提供自由添加实验明细行");
+  assert.doesNotMatch(planForm, /参考系统流程|参考系统/, "编制计划页面不得出现参考系统说明");
   assert.doesNotMatch(source, /booking-prepare|booking\.prepare|确认实验准备/, "页面不再提供独立实验准备动作");
   assert.doesNotMatch(source, /preparation|preparedBy|preparedAt|my-bookings|view\.tab = "mine"/, "页面不再保留旧准备或旧个人预约入口");
-  assert.match(source, /添加补充器材/, "新增预约须提供动态补充器材入口");
-  assert.match(source, /data-booking-resource-row/, "预约表单须渲染可增删的器材明细行");
+  assert.match(source, /function bookingResourceFields[\s\S]*data-resource-option/, "预约表单须提供可搜索的多选器材入口");
+  assert.match(bookingForm, /data-booking-resource-row/, "预约表单须渲染可增删的器材明细行");
   assert.match(source, /plan-delete/, "计划列表须提供学校管理员删除入口");
-  assert.match(source, /task-delete/, "班级实验任务列表须提供学校管理员删除入口");
+  assert.doesNotMatch(source, /data-action="task-delete"/, "班级执行记录不应提供独立删除入口");
+  assert.doesNotMatch(source, /\["tasks", "班级实验任务"\]|\["mine", "我的任务"\]/, "实验计划页不应保留独立任务页签");
+  assert.match(source, /<h3>班级执行情况<\/h3>/, "计划详情须集中展示各班执行进度");
+  assert.match(source, /f\("taskId", "计划实验"/, "预约表单应从计划实验发起，不暴露内部任务概念");
   for (const label of ["已预约实验", "已安排实验", "待登记总结实验", "我预约的实验", "我的已安排实验", "我的待登记总结实验"]) assert.match(source, new RegExp(label), `预约与安排页签：${label}`);
   assert.match(source, /\["pendingSummary", "待登记总结实验"\]/, "安排完成后进入待登记总结页签");
  assert.match(source, /maintenanceDisabled \? "" : r\.nextMaintenance/, "数量型采购明细打开时须清空并禁用维保日期");
   assert.match(source, /String\(item\?\.category \|\| ""\)/, "新增设备/入库的空白明细不得因未选分类而阻断弹窗");
  assert.match(source, /state: r\.pendingReceiptId \? "待库存复核"/, "待整单复核库存须显示锁定状态");
   assert.match(source, /table === "inventory" && scope === "school" && !r\.pendingReceiptId/, "待整单复核库存不应显示其他库存业务入口");
-  assert.match(source, /table === "assets" && scope === "school" && !r\.pendingReceiptId/, "待整单复核资产不应显示资产操作入口");
   assert.doesNotMatch(source, /资产业务|asset-actions/, "设备台账不再使用资产业务折叠菜单");
   assert.doesNotMatch(source, /资产标签|资产标识卡|asset-label/, "设备台账不再提供资产标签功能");
+  const repairForm = source.slice(source.indexOf("function repairForm"), source.indexOf("function scrapAssets"));
+  const scrapPicker = source.slice(source.indexOf("function scrapSelectionTable"), source.indexOf("function scrapForm"));
+  const scrapForm = source.slice(source.indexOf("function scrapForm"), source.indexOf("function lossSelectionTable"));
+  const lossForm = source.slice(source.indexOf("function lossSelectionTable"), source.indexOf("const returnedQty"));
+  for (const label of ["仪器名称", "维修数量", "维修金额", "维修日期", "维修商", "维修内容"]) assert.match(repairForm, new RegExp(label), `维修表单字段：${label}`);
+  assert.match(repairForm, /equipmentPicker/, "维修表单须使用可搜索的器材单选器");
+  for (const label of ["报废日期", "报废原因", "经办人"]) assert.match(scrapForm, new RegExp(label), `报废表单字段：${label}`);
+  assert.match(scrapPicker, /equipmentListToolbar|data-equipment-list-row/, "报废选择须支持器材搜索");
+  for (const label of ["损耗日期", "损耗数量", "损耗原因", "经办人"]) assert.match(lossForm, new RegExp(label), `损耗表单字段：${label}`);
+  assert.match(lossForm, /选择仪器设备/, "损耗登记须先进入参考系统的仪器设备选择步骤");
+  assert.match(lossForm, /equipmentListToolbar|data-equipment-list-row/, "损耗选择须支持器材搜索");
+  assert.match(lossForm, /placeholder=\"请选择或录入损耗原因\"/, "损耗原因须支持选择或自行录入");
+  assert.match(lossForm, /field\(\"operator\"[\s\S]*\"readonly\"/, "损耗经办人须由当前账号带出且只读");
+  assert.doesNotMatch(lossForm, /data-loss-select|name=\"lossItems\"/, "损耗数量应直接填写，不使用额外复选框代替参考交互");
+  for (const formSource of [repairForm, scrapForm, lossForm]) assert.doesNotMatch(formSource, /期望处理日期|处理类型|业务类型|关联实验安排|状态|审批|复核|验收|下次维保/, "参考表单不得增加流程字段");
+  for (const action of ["base-delete", "purchase-edit", "receipt-edit", "plan-edit", "arrangement-edit", "summary-edit", "check-edit", "hazard-edit", "archive-edit"]) assert.match(source, new RegExp(action), `管理员更正入口：${action}`);
+});
+
+test("实验计划按三类属性编制并限制到适用班级", () => {
+  const initial = M.seed();
+  const baselineInnovation = M.metrics(initial, "S1", "TERM26", "物理").innovation;
+  initial.textbooks.push({ id: "TB-TEST-CX", name: "物理校本创新实验册", subject: "物理", grade: "高一", version: "校本创新2026版", state: "启用" });
+  const f = fixture(initial), custom = f.run("admin", "customExperiment.save", { name: "自制电磁秋千", code: "CX-TEST-001", subject: "物理", grade: "高一", textbookId: "TB-TEST-CX", chapter: "校本实践", supportedModes: ["分组"], equipmentRequirements: [{ name: "铜线", spec: "漆包线", unit: "米", quantity: 3 }, { name: "磁铁", spec: "圆片", unit: "块", quantity: 4 }] });
+  assert.equal(custom.experimentCategory, "创新实验");
+  assert.equal(custom.equipmentRequirements[1].quantity, 4);
+  const plan = f.run("admin", "plan.compile", { term: "TERM26", subject: "物理", grade: "高一", textbookId: "TB-TEST-CX", name: "校本创新实验计划", classIds: ["S1-C1"], items: [{ sourceType: "学校自定义", sourceId: custom.id, mode: "分组", scheduleType: "WEEK", plannedWeek: 4 }] });
+  const item = f.db.planItems.find(row => row.planId === plan.id), tasks = f.db.teachingTasks.filter(row => row.planItemId === item.id);
+  assert.equal(item.experimentCategory, "创新实验");
+  assert.equal(item.sourceType, "学校自定义");
+  assert.deepEqual([...new Set(tasks.map(row => row.classId))], ["S1-C1"]);
+  assert.equal(M.metrics(f.db, "S1", "TERM26", "物理").innovation, baselineInnovation + 1);
+  f.reject("admin", "customExperiment.delete", { id: custom.id, reason: "已编入计划" }, /已编入实验计划/);
+});
+
+test("关系审计器覆盖主外键、状态同步和负库存", () => {
+  assert.deepEqual(M.auditRelations(M.seed()), [], "初始数据关系应完整");
+  const broken = M.seed();
+  broken.bookings[0].taskId = "MISSING-TASK";
+  broken.inventory[0].stock = -1;
+  broken.teachingTasks[0].subject = "化学";
+  broken.teachingTasks[0].subjectCode = "PHY";
+  broken.arrangements[0].resources = [{ ref: "MISSING-RESOURCE", qty: 1 }];
+  const explicitPlan = broken.plans.find(plan => plan.id === "S1-P1");
+  explicitPlan.targetMode = "EXPLICIT";
+  broken.planTargets = broken.planTargets.filter(target => target.planId !== explicitPlan.id);
+  const issues = M.auditRelations(broken);
+  assert.ok(issues.some(message => /预约.*计划实验不存在/.test(message)));
+  assert.ok(issues.some(message => /库存.*数量为负数/.test(message)));
+  assert.ok(issues.some(message => /班级执行记录.*学科编码不匹配|班级执行记录.*计划实验.*不一致/.test(message)), "审计器应识别学科编码或上下游漂移");
+  assert.ok(issues.some(message => /安排.*器材不存在/.test(message)), "审计器应识别安排中的悬空器材");
+  assert.ok(issues.some(message => /实验计划.*未登记适用班级/.test(message)), "审计器应识别显式计划缺少班级范围");
+  const crossSchool = M.seed();
+  crossSchool.assets[0].roomId = "S2-L1";
+  crossSchool.periods[0].term = "";
+  assert.ok(M.auditRelations(crossSchool).some(message => /设备.*与房间学校不一致/.test(message)), "审计器应识别资产跨校存放");
+  assert.ok(M.auditRelations(crossSchool).some(message => /节次.*学期不存在/.test(message)), "审计器应识别节次悬空学期");
+  const mismatchedPurchase = M.seed();
+  mismatchedPurchase.purchases[0].receiptId = "S1-RK0";
+  assert.ok(M.auditRelations(mismatchedPurchase).some(message => /采购.*反向关系不一致/.test(message)), "审计器应识别采购与入库单错配");
 });
 
 test("同学期学科可发布多份计划，但名称和实验明细不得重复，归档后可重新使用", () => {
@@ -233,7 +320,7 @@ test("同学期学科可发布多份计划，但名称和实验明细不得重�
   assert.deepEqual({ required: replacementMetrics.required, done: replacementMetrics.done }, { required: 2, done: 1 }, "归档复用后完成量和应开数不应翻倍");
 });
 
-test("学校管理员可删除无执行记录的计划和任务，并保护已有业务历史", () => {
+test("学校管理员可删除无执行记录的计划，并保护已有业务历史", () => {
   const f = fixture();
   f.run("admin", "base.save", { table: "assignments", term: "TERM25", classId: "S1-C2", subject: "物理", teacherId: "S1-T1", primary: true, state: "有效" });
   const plan = f.run("teacher", "plan.create", {
@@ -249,25 +336,13 @@ test("学校管理员可删除无执行记录的计划和任务，并保护已�
   assert.equal(f.db.teachingTasks.some(task => taskIds.includes(task.id)), false);
   assert.ok(f.db.logs.some(log => log.table === "plans" && log.recordId === plan.id && log.action === "删除实验计划"));
 
-  const task = physicalTask(f.db, "S1-C2", "S1-P1-I1");
-  const planItemId = task.planItemId;
-  f.run("admin", "task.delete", { id: task.id, reason: "该班级本学期不开展此实验" });
-  assert.equal(f.db.teachingTasks.some(row => row.id === task.id), false);
-  assert.ok(f.db.planItems.some(row => row.id === planItemId), "删除任务不应删除计划明细");
-  assert.ok(f.db.logs.some(log => log.table === "teachingTasks" && log.recordId === task.id && log.action === "删除实验任务"));
-  const assignment = get(f.db, "assignments", task.assignmentId);
-  f.run("admin", "base.save", { table: "assignments", id: assignment.id, term: assignment.term, classId: assignment.classId, subject: assignment.subject, teacherId: assignment.teacherId, primary: assignment.primary, state: assignment.state });
-  assert.equal(f.db.teachingTasks.some(row => row.planItemId === planItemId && row.assignmentId === assignment.id), false, "已删除任务不能因任课关系同步再次生成");
-
-  const bookedTask = physicalTask(f.db, "S1-C1", "S1-P1-I1");
-  f.reject("admin", "task.delete", { id: bookedTask.id, reason: "误删测试" }, /不能执行此操作|预约、流水或附件|不能删除/);
-  f.reject("admin", "plan.delete", { id: "S1-P1", reason: "误删测试" }, /预约、安排、总结、流水、附件或在途任务|不能删除/);
-  f.reject("teacher", "task.delete", { id: bookedTask.id, reason: "教师不应删除" }, /学校管理员/);
+  f.reject("admin", "plan.delete", { id: "S1-P1", reason: "误删测试" }, /预约、安排、总结、流水、附件或待处理实验|不能删除/);
 });
 
-test("学期任课关系为已发布计划生成班级实验任务", () => {
+test("学期任课关系为已发布计划生成班级执行记录", () => {
   const f = fixture();
-  const klass = f.run("admin", "base.save", { table: "classes", name: "高一3班", grade: "高一", students: 39, state: "在读" });
+  const klass = f.run("admin", "base.save", { table: "classes", name: "高一5班", grade: "高一", students: 39, state: "在读" });
+  f.db.planTargets.push({ id: `S1-P1-${klass.id}`, school: "S1", planId: "S1-P1", classId: klass.id, grade: "高一", state: "启用" });
   const assignment = f.run("admin", "base.save", { table: "assignments", term: "TERM26", classId: klass.id, subject: "物理", teacherId: "S1-T1", primary: true, state: "有效" });
   assert.equal(assignment.classId, klass.id);
   const tasks = f.db.teachingTasks.filter(task => task.assignmentId === assignment.id);
@@ -275,15 +350,16 @@ test("学期任课关系为已发布计划生成班级实验任务", () => {
   assert.ok(tasks.every(task => task.classId === klass.id && task.teacherId === "S1-T1" && task.term === "TERM26"));
   assert.deepEqual(new Set(tasks.map(task => M.taskContext(f.db, task).experiment.name)), new Set(["测量物体的速度", "探究加速度与力、质量的关系"]));
   const teacher = get(f.db, "staff", "S1-T1"), teacherForm = { table: "staff", id: teacher.id, name: teacher.name, role: teacher.role, subject: teacher.subject, title: teacher.title, phone: teacher.phone, qualification: teacher.qualification, sex: teacher.sex, departmentId: teacher.departmentId, enabled: true };
-  f.reject("admin", "base.save", { ...teacherForm, subject: "化学" }, /任课关系或实验任务引用/);
+  f.reject("admin", "base.save", { ...teacherForm, subject: "化学" }, /任课或实验计划执行/);
   f.reject("admin", "base.save", { ...teacherForm, enabled: false }, /有效任课关系/);
   assert.equal(get(f.db, "staff", "S1-T1").subject, "物理");
   f.reject("admin", "base.save", { table: "assignments", term: "TERM26", classId: klass.id, subject: "物理", teacherId: "S1-T1", primary: true, state: "有效" }, /已存在/);
 });
 
-test("任课教师可批量设置任课班级并继续生成班级实验任务", () => {
+test("任课教师可批量设置任课班级并继续生成班级执行记录", () => {
   const f = fixture();
-  const klass = f.run("admin", "base.save", { table: "classes", name: "高一3班", grade: "高一", students: 39, state: "在读" });
+  const klass = f.run("admin", "base.save", { table: "classes", name: "高一5班", grade: "高一", students: 39, state: "在读" });
+  f.db.planTargets.push({ id: `S1-P1-${klass.id}`, school: "S1", planId: "S1-P1", classId: klass.id, grade: "高一", state: "启用" });
   const result = f.run("admin", "teacher.assignments.save", { teacherId: "S1-T1", term: "TERM26", rows: [{ classId: klass.id, subject: "物理", primary: true, state: "有效" }] });
   const assignment = result.assignments.find(row => row.classId === klass.id);
   assert.ok(assignment);
@@ -303,7 +379,7 @@ test("班级名称在同一学校内唯一", () => {
 
 test("预约只表达申请日期节次与物品类型需求，并允许新增计划外器材", () => {
   const f = fixture(), task = physicalTask(f.db, "S1-C2", "S1-P1-I1");
-  f.reject("teacher", "booking.create", { taskId: task.id, requestedDate: M.TODAY, requestedPeriod: 2, groups: 8, requestedResources: [{ itemId: "IT10", qty: 1 }], note: "物理实验不应申请危化品" }, /危化品只用于化学实验/);
+  f.reject("teacher", "booking.create", { taskId: task.id, requestedDate: M.TODAY, requestedPeriod: 2, groups: 8, requestedResources: [{ itemId: "IT10", qty: 1 }], note: "物理实验不应申请危化品" }, /危化品只用于化学实验/, task.teacherId);
   const booking = createPhysicsBooking(f, { requestedResources: [{ itemId: "IT3", qty: 2 }] });
   assert.equal(booking.state, "待安排");
   assert.equal(booking.requestedDate, M.TODAY);
@@ -311,28 +387,40 @@ test("预约只表达申请日期节次与物品类型需求，并允许新增�
   for (const key of ["roomId", "technicianId", "scheduledDate", "startPeriod", "endPeriod", "labId", "managerId", "start", "end"]) assert.equal(Object.hasOwn(booking, key), false, key);
   assert.ok(booking.requestedResources[0].itemId === "IT3" && booking.requestedResources[0].name, "预约明细直接保存物品类型信息");
   assert.equal(get(f.db, "teachingTasks", booking.taskId).state, "待安排");
-  f.reject("teacher", "booking.create", { taskId: booking.taskId, requestedDate: M.TODAY, requestedPeriod: 3, groups: 8, requestedResources: [] }, /状态|有效预约/);
+  f.reject("teacher", "booking.create", { taskId: booking.taskId, requestedDate: M.TODAY, requestedPeriod: 3, groups: 8, requestedResources: [] }, /状态|有效预约/, task.teacherId);
+});
+
+test("预约物品快照保留显式学科范围并拦截不兼容学科", () => {
+  const scopedItem = { itemId: "TEST-MULTI-SCOPE", classificationCode: "TEST-MULTI-SCOPE", name: "跨学科观察记录套件", spec: "V1", category: "耗材", unit: "套", trackingMode: "QUANTITY", maintenanceRequired: false, subjectScopes: ["物理", "生物学"], qty: 1 };
+  const f = fixture(), booking = createPhysicsBooking(f, { requestedResources: [scopedItem] }), saved = booking.requestedResources[0];
+  assert.deepEqual(saved.subjectScopes, ["物理", "生物"], "兼容范围应以标准内部值持久化");
+  assert.equal(M.itemFitsSubject(saved, "生物学"), true);
+  assert.deepEqual(M.auditRelations(f.db), []);
+  const incompatible = fixture(), task = physicalTask(incompatible.db);
+  incompatible.reject("teacher", "booking.create", { taskId: task.id, requestedDate: M.TODAY, requestedPeriod: 2, groups: 8, requestedResources: [{ ...scopedItem, itemId: "TEST-CHEM-ONLY", classificationCode: "TEST-CHEM-ONLY", subjectScopes: ["化学"] }], note: "不应保存" }, /补充器材须与当前实验学科一致/, task.teacherId);
 });
 
 test("管理员安排校验权限、学科、容量以及房间班级教师实验负责人冲突", () => {
   const f = fixture(), booking = createPhysicsBooking(f);
   f.reject("teacher", "booking.arrange", { id: booking.id }, /学校管理员/);
-  f.reject("admin", "booking.arrange", { id: booking.id, venueType: "实验室", roomId: "S1-L2", scheduledDate: M.TODAY, startPeriod: 2, endPeriod: 2, technicianId: "S1-T4", resources: [] }, /实验学科/);
+  f.reject("admin", "booking.arrange", { id: booking.id, venueType: "实验室", roomId: "S1-L2", scheduledDate: M.TODAY, startPeriod: 2, endPeriod: 2, technicianId: "S1-T0", resources: [] }, /实验学科/);
   const small = f.run("admin", "base.save", { table: "rooms", name: "物理小教室", roomNo: "A099", type: "教学实验室", subject: "物理", area: 30, seats: 20, builder: "", builtAt: "", stage: "高中", features: "", note: "", state: "可用" });
-  f.reject("admin", "booking.arrange", { id: booking.id, venueType: "实验室", roomId: small.id, scheduledDate: M.TODAY, startPeriod: 2, endPeriod: 2, technicianId: "S1-T4", resources: [] }, /容量不足/);
-  f.reject("admin", "booking.arrange", { id: booking.id, venueType: "实验室", roomId: "S1-L1", scheduledDate: M.TODAY, startPeriod: 1, endPeriod: 1, technicianId: "S1-T4", resources: [] }, /安排冲突/);
-  f.reject("admin", "booking.arrange", { id: booking.id, venueType: "实验室", roomId: "S1-L1", scheduledDate: M.TODAY, startPeriod: 3, endPeriod: 3, technicianId: "S1-T4", resources: [{ ref: "S1-I4", qty: 1 }] }, /实际器材须与当前实验学科一致/);
+  f.reject("admin", "booking.arrange", { id: booking.id, venueType: "实验室", roomId: small.id, scheduledDate: M.TODAY, startPeriod: 2, endPeriod: 2, technicianId: "S1-T0", resources: [] }, /容量不足/);
+  f.reject("admin", "booking.arrange", { id: booking.id, venueType: "实验室", roomId: "S1-L1", scheduledDate: M.TODAY, startPeriod: 1, endPeriod: 1, technicianId: "S1-T0", resources: [] }, /安排冲突/);
+  f.reject("admin", "booking.arrange", { id: booking.id, venueType: "实验室", roomId: "S1-L1", scheduledDate: M.TODAY, startPeriod: 3, endPeriod: 3, technicianId: "S1-T0", resources: [{ ref: "S1-I4", qty: 1 }] }, /实际器材须与当前实验学科一致/);
   const arrangement = arrange(f, booking.id, { startPeriod: 3, endPeriod: 3 });
   assert.equal(arrangement.state, "已安排");
   assert.equal(arrangement.roomId, "S1-L1");
-  assert.equal(arrangement.technicianId, "S1-T4");
+  assert.equal(arrangement.technicianId, "S1-T0");
   assert.equal(get(f.db, "teachingTasks", booking.taskId).state, "已安排");
-  const nextClass = f.run("admin", "base.save", { table: "classes", name: "高一3班", grade: "高一", students: 39, state: "在读" });
+  const nextClass = f.run("admin", "base.save", { table: "classes", name: "高一5班", grade: "高一", students: 39, state: "在读" });
+  f.db.planTargets.push({ id: `S1-P1-${nextClass.id}`, school: "S1", planId: "S1-P1", classId: nextClass.id, grade: "高一", state: "启用" });
   f.run("admin", "base.save", { table: "assignments", term: "TERM26", classId: nextClass.id, subject: "物理", teacherId: "S1-T1", primary: true, state: "有效" });
   const nextTask = physicalTask(f.db, nextClass.id);
   const oldRequestSlot = f.run("teacher", "booking.create", { taskId: nextTask.id, requestedDate: M.TODAY, requestedPeriod: 2, groups: 8, requestedResources: [], note: "原申请节次已释放" });
   assert.equal(oldRequestSlot.state, "待安排");
-  const conflictClass = f.run("admin", "base.save", { table: "classes", name: "高一4班", grade: "高一", students: 38, state: "在读" });
+  const conflictClass = f.run("admin", "base.save", { table: "classes", name: "高一6班", grade: "高一", students: 38, state: "在读" });
+  f.db.planTargets.push({ id: `S1-P1-${conflictClass.id}`, school: "S1", planId: "S1-P1", classId: conflictClass.id, grade: "高一", state: "启用" });
   f.run("admin", "base.save", { table: "assignments", term: "TERM26", classId: conflictClass.id, subject: "物理", teacherId: "S1-T1", primary: true, state: "有效" });
   const conflictTask = physicalTask(f.db, conflictClass.id);
   f.reject("teacher", "booking.create", { taskId: conflictTask.id, requestedDate: M.TODAY, requestedPeriod: 3, groups: 8, requestedResources: [], note: "应与最终安排冲突" }, /预约申请冲突/);
@@ -349,14 +437,14 @@ test("安排地点按实验室、教室、其他三分支联动并只保存对�
     const f = fixture();
     const classroom = f.run("admin", "base.save", { table: "rooms", name: "高一普通教室", roomNo: "A101", type: "普通教室", subject: "", area: 72, seats: 50, builder: "", builtAt: "", stage: "高中", features: "多媒体", note: "", state: "可用" });
     const booking = createPhysicsBooking(f);
-    f.reject("admin", "booking.arrange", { id: booking.id, venueType: "教室", roomId: "S1-L1", venueText: "", scheduledDate: M.TODAY, startPeriod: 2, endPeriod: 2, technicianId: "S1-T4", resources: [] }, /普通教室/);
+    f.reject("admin", "booking.arrange", { id: booking.id, venueType: "教室", roomId: "S1-L1", venueText: "", scheduledDate: M.TODAY, startPeriod: 2, endPeriod: 2, technicianId: "S1-T0", resources: [] }, /普通教室/);
     const row = arrange(f, booking.id, { venueType: "教室", roomId: classroom.id, venueText: "应被清空" });
     assert.equal(row.roomId, classroom.id);
     assert.equal(row.venueText, "");
   }
   {
     const f = fixture(), booking = createPhysicsBooking(f);
-    f.reject("admin", "booking.arrange", { id: booking.id, venueType: "其他", roomId: "S1-L1", venueText: "", scheduledDate: M.TODAY, startPeriod: 2, endPeriod: 2, technicianId: "S1-T4", resources: [] }, /其他地点说明/);
+    f.reject("admin", "booking.arrange", { id: booking.id, venueType: "其他", roomId: "S1-L1", venueText: "", scheduledDate: M.TODAY, startPeriod: 2, endPeriod: 2, technicianId: "S1-T0", resources: [] }, /其他地点说明/);
     const row = arrange(f, booking.id, { venueType: "其他", roomId: "S1-L1", venueText: "校园科技馆" });
     assert.equal(row.roomId, "");
     assert.equal(row.venueText, "校园科技馆");
@@ -367,10 +455,10 @@ test("停用节次不可预约或安排，两课时实验须覆盖连续启用�
   const f = fixture(), fourth = get(f.db, "periods", "S1-K4");
   f.run("admin", "base.save", { table: "periods", id: fourth.id, name: fourth.name, number: fourth.number, start: fourth.start, end: fourth.end, state: "停用" });
   const onePeriodTask = physicalTask(f.db, "S1-C2", "S1-P1-I1");
-  f.reject("teacher", "booking.create", { taskId: onePeriodTask.id, requestedDate: M.TODAY, requestedPeriod: 4, groups: 8, requestedResources: [], note: "停用节次" }, /已启用的节次/);
+  f.reject("teacher", "booking.create", { taskId: onePeriodTask.id, requestedDate: M.TODAY, requestedPeriod: 4, groups: 8, requestedResources: [], note: "停用节次" }, /已启用的节次/, onePeriodTask.teacherId);
   const booking = createPhysicsBooking(f, { planItemId: "S1-P1-I2", requestedPeriod: 3 });
-  f.reject("admin", "booking.arrange", { id: booking.id, venueType: "实验室", roomId: "S1-L1", venueText: "", scheduledDate: M.TODAY, startPeriod: 3, endPeriod: 3, technicianId: "S1-T4", resources: [] }, /至少2个连续启用节次/);
-  f.reject("admin", "booking.arrange", { id: booking.id, venueType: "实验室", roomId: "S1-L1", venueText: "", scheduledDate: M.TODAY, startPeriod: 3, endPeriod: 4, technicianId: "S1-T4", resources: [] }, /至少2个连续启用节次/);
+  f.reject("admin", "booking.arrange", { id: booking.id, venueType: "实验室", roomId: "S1-L1", venueText: "", scheduledDate: M.TODAY, startPeriod: 3, endPeriod: 3, technicianId: "S1-T0", resources: [] }, /至少2个连续启用节次/);
+  f.reject("admin", "booking.arrange", { id: booking.id, venueType: "实验室", roomId: "S1-L1", venueText: "", scheduledDate: M.TODAY, startPeriod: 3, endPeriod: 4, technicianId: "S1-T0", resources: [] }, /至少2个连续启用节次/);
   const row = arrange(f, booking.id, { startPeriod: 5, endPeriod: 6 });
   assert.deepEqual([row.startPeriod, row.endPeriod], [5, 6]);
 });
@@ -392,7 +480,8 @@ test("节次按学校和学期分版，同版编号与时间不得冲突", () =>
 test("单件资产按实验时段并发占用，重叠拒绝而不重叠可复用", () => {
   const f = fixture();
   const teacher = f.run("admin", "base.save", { table: "staff", name: "钱物理", role: "teacher", subject: "物理", title: "一级教师", phone: "", qualification: "教师资格证", sex: "男", departmentId: "S1-D2", enabled: true });
-  const klass = f.run("admin", "base.save", { table: "classes", name: "高一3班", grade: "高一", students: 38, state: "在读" });
+  const klass = f.run("admin", "base.save", { table: "classes", name: "高一5班", grade: "高一", students: 38, state: "在读" });
+  f.db.planTargets.push({ id: `S1-P1-${klass.id}`, school: "S1", planId: "S1-P1", classId: klass.id, grade: "高一", state: "启用" });
   f.run("admin", "base.save", { table: "assignments", term: "TERM26", classId: klass.id, subject: "物理", teacherId: teacher.id, primary: true, state: "有效" });
   const secondLab = f.run("admin", "base.save", { table: "rooms", name: "物理实验室 2", roomNo: "A203", type: "教学实验室", subject: "物理", area: 96, seats: 48, builder: "", builtAt: "", stage: "高中", features: "", note: "", state: "可用" });
   const first = createPhysicsBooking(f);
@@ -456,6 +545,20 @@ test("实验总结完成班级任务但不完成计划，并拦截未来完成�
   f.reject("teacher", "booking.summary", { id: arrangement.id, actualDate: M.TODAY, effect: "重复", equipmentCondition: "完好" }, /状态|已提交/);
 });
 
+test("科学学科可独立完成计划任务、预约、安排、总结和统计闭环", () => {
+  const f = fixture(), task = f.db.teachingTasks.find(row => row.school === "S1" && row.classId === "S1-C2" && row.planItemId === "S1-P4-I1"), before = M.metrics(f.db, "S1", "TERM26", "科学").done;
+  assert.ok(task, "科学班级实验任务应由计划和任课关系生成");
+  const booking = f.run("teacher", "booking.create", { taskId: task.id, requestedDate: M.TODAY, requestedPeriod: 3, groups: 8, requestedResources: [], note: "科学探究预约" }, task.teacherId);
+  const arrangement = f.run("admin", "booking.arrange", { id: booking.id, venueType: "实验室", roomId: "S1-L4", venueText: "", scheduledDate: M.TODAY, startPeriod: 3, endPeriod: 3, technicianId: "S1-T0", resources: [{ ref: "S1-A7", qty: 1 }], note: "科学实验室安排" });
+  const summary = f.run("teacher", "booking.summary", { id: arrangement.id, actualDate: M.TODAY, effect: "学生完成观察、测量与记录", improvement: "补充校园样方对比", equipmentCondition: "放大镜完好", note: "", overviewImages: [], studentImages: [] }, task.teacherId);
+  for (const row of [get(f.db, "teachingTasks", task.id), get(f.db, "bookings", booking.id), get(f.db, "arrangements", arrangement.id), get(f.db, "summaries", summary.id)]) {
+    assert.equal(row.subject, "科学");
+    assert.equal(row.subjectCode, "SCI");
+  }
+  assert.equal(M.metrics(f.db, "S1", "TERM26", "科学").done, before + 1);
+  assert.deepEqual(M.auditRelations(f.db), []);
+});
+
 test("入库明细直接保存物品信息并受管理方式约束", () => {
   const f = fixture();
   const base = { supplier: "测试供应商", date: M.TODAY, purchaseDate: M.TODAY, note: "" };
@@ -483,8 +586,8 @@ test("数量库存的存放房间必须与仪器学科兼容", () => {
   const chemistryTask = f.db.teachingTasks.find(task => task.school === "S1" && task.classId === "S1-C2" && task.planItemId === "S1-P2-I1");
   const request = f.run("admin", "booking.create", { taskId: chemistryTask.id, requestedDate: M.TODAY, requestedPeriod: 2, groups: 8, requestedResources: [{ itemId: "IT2", qty: 1 }, { itemId: "IT8", qty: 1 }], note: "按物品类型提出补充需求" });
   assert.ok(request.requestedResources.every(resource => resource.name && resource.itemId), "预约明细直接保存物品类型");
-  f.reject("admin", "booking.arrange", { id: request.id, venueType: "其他", roomId: "", venueText: "临时实验场地", scheduledDate: M.TODAY, startPeriod: 2, endPeriod: 2, technicianId: "S1-T4", resources: [{ ref: "S1-A2", qty: 1 }] }, /房间已停用/);
-  f.reject("admin", "booking.arrange", { id: request.id, venueType: "其他", roomId: "", venueText: "临时实验场地", scheduledDate: M.TODAY, startPeriod: 2, endPeriod: 2, technicianId: "S1-T4", resources: [{ ref: "S1-I2", qty: 1 }] }, /房间已停用/);
+  f.reject("admin", "booking.arrange", { id: request.id, venueType: "其他", roomId: "", venueText: "临时实验场地", scheduledDate: M.TODAY, startPeriod: 2, endPeriod: 2, technicianId: "S1-T0", resources: [{ ref: "S1-A2", qty: 1 }] }, /房间已停用/);
+  f.reject("admin", "booking.arrange", { id: request.id, venueType: "其他", roomId: "", venueText: "临时实验场地", scheduledDate: M.TODAY, startPeriod: 2, endPeriod: 2, technicianId: "S1-T0", resources: [{ ref: "S1-I2", qty: 1 }] }, /房间已停用/);
   f.reject("admin", "flow.create", { itemId: "S1-I2", kind: "领用", qty: 1, date: M.TODAY, reason: "停用房间不得出库" }, /存放房间已停用/);
   f.reject("admin", "flow.decide", { id: "LY-20260831-001", approve: true, reason: "停用后不得复核记账" }, /存放房间已停用/);
 });
@@ -660,15 +763,11 @@ test("关联实验安排的领用必须命中实际器材且净领用与待复�
   assert.equal(replacement.state, "待复核");
 });
 
-test("设备处理不含借还动作，并重检资产当前状态", () => {
+test("设备处理不含借还动作，旧维修状态机命令不可用", () => {
   const noLoan = fixture();
   noLoan.reject("admin", "asset.lend", { id: "S1-A5", borrower: "校内教师", date: M.TODAY, due: "2026-09-05", reason: "不提供借用" }, /暂不支持|未知|不支持/);
   noLoan.reject("admin", "loan.return", { id: "S1-A5", date: M.TODAY }, /暂不支持|未知|不支持/);
-
-  const repairFixture = fixture(), repair = repairFixture.run("admin", "repair.create", { assetId: "S1-A1", kind: "维修", date: M.TODAY, due: "2026-09-05", reason: "机械故障" });
-  get(repairFixture.db, "assets", "S1-A1").state = "正常使用";
-  repairFixture.reject("admin", "repair.finish", { id: repair.id, maintenanceDate: M.TODAY, vendor: "", cost: 0, reason: "处理完成" }, /当前状态/);
-  assert.equal(get(repairFixture.db, "repairs", repair.id).state, "处理中");
+  for (const command of ["repair.create", "repair.start", "repair.finish", "repair.accept", "repair.cancel", "repair.decide"]) noLoan.reject("admin", command, { id: "WX-20260824-001" }, /暂不支持|未知|不支持/);
 });
 
 test("系统不提供设备调拨、库存调拨和借还业务", () => {
@@ -694,7 +793,7 @@ test("危化品存放条件和过期限制覆盖入库、实际安排、领用�
   const booking = f.run("teacher", "booking.create", { taskId: chemistryTask.id, requestedDate: M.TODAY, requestedPeriod: 2, groups: 8, requestedResources: [{ itemId: "IT10", qty: 1 }], note: "申请物品类型，不指定过期库存余额" }, "S1-T2");
   assert.equal(booking.requestedResources[0].itemId, "IT10");
   assert.equal(booking.requestedResources[0].name, "浓硫酸");
-  f.reject("admin", "booking.arrange", { id: booking.id, venueType: "实验室", roomId: "S1-L2", venueText: "", scheduledDate: M.TODAY, startPeriod: 2, endPeriod: 2, technicianId: "S1-T4", resources: [{ ref: expired.id, qty: 1 }] }, /已过期/);
+  f.reject("admin", "booking.arrange", { id: booking.id, venueType: "实验室", roomId: "S1-L2", venueText: "", scheduledDate: M.TODAY, startPeriod: 2, endPeriod: 2, technicianId: "S1-T0", resources: [{ ref: expired.id, qty: 1 }] }, /已过期/);
   f.reject("admin", "flow.create", { itemId: expired.id, kind: "领用", qty: 1, date: M.TODAY, reason: "过期仍领用" }, /过期危化品/);
   f.reject("admin", "flow.create", { itemId: expired.id, kind: "入库", qty: 1, date: M.TODAY, reason: "过期仍入库" }, /过期危化品/);
   assert.equal(f.run("admin", "flow.create", { itemId: expired.id, kind: "损耗", qty: 1, date: M.TODAY, reason: "过期破损核销" }).state, "待复核");
@@ -705,41 +804,153 @@ test("危化品存放条件和过期限制覆盖入库、实际安排、领用�
   reviewFixture.reject("technician", "flow.decide", { id: pendingIssue.id, approve: true, reason: "到期后不得通过" }, /已过期|过期危化品/);
 });
 
-test("维修直接处理、维保计划待执行且各处理日期受约束", () => {
+test("维修、报废和易耗品损耗严格按参考系统直接登记", () => {
   const f = fixture();
-  const repair = f.run("teacher", "repair.create", { assetId: "S1-A1", kind: "维修", date: M.TODAY, due: "2026-09-07", reason: "调焦机构异常" });
-  assert.equal(repair.state, "处理中");
-  f.reject("district", "repair.decide", { id: repair.id, approve: true, reason: "不应审批" }, /不设置区级审批/);
-  f.reject("teacher", "repair.create", { assetId: "S1-A2", kind: "报废", date: M.TODAY, due: "2026-09-07", reason: "教师越权报废" }, /只能提交报修/);
-  f.reject("admin", "repair.create", { assetId: "S1-A5", kind: "维修", date: "2026-09-01", due: "2026-09-07", reason: "未来登记" }, /登记日期不能晚于当前日期/);
-  const maintenance = f.run("admin", "repair.create", { assetId: "S1-A2", kind: "维保", date: M.TODAY, due: "2026-09-07", reason: "周期维保计划" });
-  assert.equal(maintenance.state, "待执行");
-  assert.equal(get(f.db, "assets", "S1-A2").state, "正常使用", "待执行维保不占用资产");
-  f.run("technician", "repair.start", { id: maintenance.id, date: M.TODAY });
-  assert.equal(get(f.db, "repairs", maintenance.id).state, "处理中");
-  assert.equal(get(f.db, "assets", "S1-A2").state, "维修中");
-  f.reject("technician", "repair.finish", { id: maintenance.id, maintenanceDate: "2026-08-30", vendor: "服务商", cost: 100, reason: "日期过早" }, /不能早于开始日期/);
-  f.reject("technician", "repair.finish", { id: maintenance.id, maintenanceDate: "2026-09-01", vendor: "服务商", cost: 100, reason: "未来完成" }, /晚于当前日期/);
-  f.run("technician", "repair.finish", { id: maintenance.id, maintenanceDate: M.TODAY, vendor: "服务商", cost: 100, reason: "完成清洁校准" });
-  f.reject("admin", "repair.accept", { id: maintenance.id, nextMaintenance: M.TODAY, reason: "日期未后移" }, /须晚于本次处理日期/);
-  f.run("admin", "repair.accept", { id: maintenance.id, nextMaintenance: "2027-02-28", reason: "验收通过" });
-  assert.equal(get(f.db, "assets", "S1-A2").nextMaintenance, "2027-02-28");
+  const repair = f.run("teacher", "repair.register", { assetId: "S1-A1", qty: 2, cost: 120.5, maintenanceDate: M.TODAY, vendor: "青浦维修服务部", content: "调焦机构维修" });
+  assert.deepEqual(Object.keys(repair).sort(), ["assetId", "content", "cost", "id", "kind", "maintenanceDate", "qty", "registeredAt", "registrar", "school", "snapshot", "vendor"].sort());
+  assert.equal(repair.kind, "维修");
+  assert.equal(get(f.db, "assets", "S1-A1").state, "正常使用", "维修登记不改变设备状态");
+  assert.equal(repair.registrar, "张明华");
+  const edited = f.run("teacher", "repair.register", { id: repair.id, assetId: "S1-A1", qty: 1, cost: 88, maintenanceDate: M.TODAY, vendor: "青浦维修服务部", content: "更换调焦齿轮" });
+  assert.equal(edited.content, "更换调焦齿轮");
+  assert.equal(edited.cost, 88);
+  f.reject("admin", "repair.register", { assetId: "S1-A2", qty: 1, cost: 0, maintenanceDate: "2026-09-01", vendor: "", content: "未来日期" }, /维修日期不能晚于当前日期/);
 
-  const receipt = f.run("admin", "receipt.create", { supplier: "测试供应商", date: M.TODAY, purchaseDate: M.TODAY, note: "", items: [{ classificationCode: "NO-MAINT-ASSET", name: "免维保测试设备", spec: "V1", category: "物理仪器", unit: "台", trackingMode: "SERIALIZED", maintenanceRequired: false, qty: 1, price: 100, roomId: "S1-R4", nextMaintenance: "" }] });
-  const noMaintenanceAsset = f.db.assets.find(asset => asset.sourceId === receipt.id);
-  f.reject("admin", "repair.create", { assetId: noMaintenanceAsset.id, kind: "维保", date: M.TODAY, due: "2026-09-07", reason: "不应维保" }, /不需要周期维保/);
-
-  const scrap = f.run("admin", "repair.create", { assetId: "S1-A6", kind: "报废", date: M.TODAY, due: "2026-09-07", reason: "已达使用年限且无法修复" });
-  assert.equal(scrap.state, "待审核");
-  f.run("district", "repair.decide", { id: scrap.id, approve: true, reason: "核验后同意报废" });
-  assert.equal(get(f.db, "repairs", scrap.id).state, "已完成");
+  const scrap = f.run("admin", "scrap.register", { assetIds: ["S1-A6"], scrapDate: M.TODAY, reason: "达到报废年限且无法修复", operator: "顾文清" });
+  assert.deepEqual(Object.keys(get(f.db, "repairs", scrap.id)).sort(), ["assetId", "batchId", "id", "kind", "operator", "qty", "reason", "school", "scrapDate", "snapshot"].sort());
   assert.equal(get(f.db, "assets", "S1-A6").state, "已报废");
+  f.run("admin", "scrap.delete", { id: scrap.id });
+  assert.equal(get(f.db, "assets", "S1-A6").state, "正常使用", "删除报废登记恢复设备状态");
+
+  const stock = get(f.db, "inventory", "S1-I2"), before = stock.stock;
+  const loss = f.run("admin", "loss.register", { itemId: stock.id, qty: 2, date: M.TODAY, reason: "实验操作中破损", operator: "顾文清" });
+  assert.deepEqual(Object.keys(loss).sort(), ["date", "id", "itemId", "kind", "operator", "qty", "reason", "school", "snapshot"].sort());
+  assert.equal(get(f.db, "inventory", stock.id).stock, before - 2, "损耗登记直接扣减现有数量");
+  f.run("admin", "loss.delete", { id: loss.id });
+  assert.equal(get(f.db, "inventory", stock.id).stock, before, "删除损耗登记恢复现有数量");
+
+  const first = get(f.db, "inventory", "S1-I1"), second = get(f.db, "inventory", "S1-I2"), firstBefore = first.stock, secondBefore = second.stock;
+  const batch = f.run("admin", "loss.batch", { date: M.TODAY, reason: "批量登记课堂实验损耗", operator: "顾文清", rows: [{ itemId: first.id, qty: 1 }, { itemId: second.id, qty: 2 }] });
+  assert.equal(batch.ids.length, 2, "一次表单可登记多条易耗品明细");
+  assert.equal(get(f.db, "inventory", first.id).stock, firstBefore - 1);
+  assert.equal(get(f.db, "inventory", second.id).stock, secondBefore - 2);
+});
+
+test("管理员可更正和删除无下游记录的采购入库并保持账实一致", () => {
+  const f = fixture();
+  let purchase = f.run("admin", "purchase.create", { purpose: "测试采购", date: M.TODAY, items: [{ classificationCode: "TEST-CRUD-E", name: "测试器材", spec: "T1", category: "物理仪器", unit: "台", trackingMode: "SERIALIZED", maintenanceRequired: false, qty: 1, price: 10 }] });
+  purchase = f.run("admin", "purchase.create", { id: purchase.id, purpose: "更正后的采购用途", date: M.TODAY, items: purchase.items });
+  assert.equal(purchase.purpose, "更正后的采购用途");
+  f.run("admin", "purchase.delete", { id: purchase.id, reason: "测试删除" });
+  assert.equal(f.db.purchases.some(row => row.id === purchase.id), false);
+
+  const receipt = f.run("admin", "receipt.create", { supplier: "测试供应商", date: M.TODAY, purchaseDate: M.TODAY, note: "", items: [{ classificationCode: "TEST-ROLLBACK-E", name: "可回滚设备", spec: "T1", category: "物理仪器", unit: "台", trackingMode: "SERIALIZED", maintenanceRequired: false, qty: 1, price: 10, roomId: "", nextMaintenance: "", expiry: "" }] });
+  const generated = f.db.assets.find(asset => asset.sourceId === receipt.id);
+  assert.ok(generated);
+  f.run("admin", "receipt.update", { id: receipt.id, supplier: "更正供应商", date: M.TODAY, purchaseDate: M.TODAY, note: "已更正" });
+  assert.equal(get(f.db, "assets", generated.id).supplier, "更正供应商");
+  f.run("admin", "receipt.delete", { id: receipt.id, reason: "录入错误" });
+  assert.equal(f.db.receipts.some(row => row.id === receipt.id), false);
+  assert.equal(f.db.assets.some(asset => asset.sourceId === receipt.id), false);
+
+  const stockReceipt = f.run("admin", "receipt.create", { supplier: "测试供应商", date: M.TODAY, purchaseDate: M.TODAY, note: "", items: [{ classificationCode: "TEST-ROLLBACK-Q", name: "回滚保护耗材", spec: "T1", category: "耗材", unit: "包", trackingMode: "QUANTITY", maintenanceRequired: false, qty: 5, price: 2, roomId: "S1-L1", nextMaintenance: "", expiry: "" }] });
+  const stockFlow = f.db.flows.find(flow => flow.receiptId === stockReceipt.id), stock = get(f.db, "inventory", stockFlow.itemId);
+  f.run("admin", "flow.create", { itemId: stock.id, kind: "领用", qty: 1, date: M.TODAY, reason: "形成下游流水" });
+  f.reject("admin", "receipt.delete", { id: stockReceipt.id, reason: "不应删除" }, /已有其他库存流水/);
+  f.reject("admin", "receipt.delete", { id: "S1-RK0", reason: "不应删除" }, /已有维修、报废、实验安排或附件/);
+  assert.deepEqual(M.auditRelations(f.db), []);
+});
+
+test("管理员可更正未执行计划、预约、安排和总结并同步回退状态", () => {
+  const f = fixture();
+  let plan = f.run("admin", "plan.create", { term: "TERM26", subject: "物理", name: "可修改测试计划", grade: "高一", version: "测试版", items: [planItemInput("EXTRA", { experimentName: "全新测试实验", chapter: "测试章", required: "选做", mode: "演示", plannedWeek: 4 })] });
+  plan = f.run("admin", "plan.create", { id: plan.id, term: "TERM26", subject: "物理", name: "已修改测试计划", grade: "高一", version: "测试版2", items: [planItemInput("EXTRA", { experimentName: "全新测试实验2", chapter: "测试章2", required: "选做", mode: "演示", plannedWeek: 5 })] });
+  assert.equal(plan.name, "已修改测试计划");
+  const planItemIds = new Set(f.db.planItems.filter(item => item.planId === plan.id).map(item => item.id)), task = f.db.teachingTasks.find(row => planItemIds.has(row.planItemId));
+  const booking = f.run("admin", "booking.create", { taskId: task.id, requestedDate: M.TODAY, requestedPeriod: 3, requestedResources: [], note: "测试预约" });
+  f.run("admin", "booking.resubmit", { id: booking.id, requestedDate: M.TODAY, requestedPeriod: 4, requestedResources: [], note: "已修改" });
+  assert.equal(get(f.db, "bookings", booking.id).requestedPeriod, 4);
+  f.run("admin", "booking.delete", { id: booking.id, reason: "测试删除" });
+  assert.equal(get(f.db, "teachingTasks", task.id).state, "待预约");
+
+  const arrangement = get(f.db, "arrangements", "S1-AP1");
+  f.run("admin", "arrangement.update", { id: arrangement.id, venueType: arrangement.venueType, roomId: arrangement.roomId, venueText: arrangement.venueText, scheduledDate: arrangement.scheduledDate, startPeriod: arrangement.startPeriod, endPeriod: arrangement.endPeriod, technicianId: arrangement.technicianId, note: "更正安排说明", resources: arrangement.resources });
+  const summary = f.run("admin", "booking.summary", { id: arrangement.id, actualDate: M.TODAY, effect: "良好", improvement: "", equipmentCondition: "完好", note: "", overviewImages: [], studentImages: [] });
+  f.run("admin", "summary.update", { id: summary.id, actualDate: M.TODAY, effect: "更正为优秀", improvement: "", equipmentCondition: "完好", note: "" });
+  assert.equal(get(f.db, "summaries", summary.id).effect, "更正为优秀");
+  f.run("admin", "summary.delete", { id: summary.id, reason: "需重新填写" });
+  assert.equal(get(f.db, "arrangements", arrangement.id).state, "已安排");
+  assert.equal(get(f.db, "bookings", arrangement.bookingId).state, "已安排");
+  assert.deepEqual(M.auditRelations(f.db), []);
+});
+
+test("基础档案、安全记录和待归档资料支持受保护的改删", () => {
+  const f = fixture();
+  const emptySchool = f.run("district", "base.save", { table: "schools", name: "临时空学校", code: "TMP001", stage: "高中" });
+  f.run("district", "base.delete", { table: "schools", id: emptySchool.id, reason: "测试删除" });
+  assert.equal(f.db.schools.some(row => row.id === emptySchool.id), false);
+  const department = f.run("admin", "base.save", { table: "departments", name: "临时部门", state: "启用" });
+  f.run("admin", "base.delete", { table: "departments", id: department.id, reason: "测试删除" });
+  f.reject("admin", "base.delete", { table: "departments", id: "S1-D2", reason: "不应删除" }, /关联人员/);
+
+  let task = f.run("district", "task.create", { roomId: "S1-L1", kind: "测试检查", due: M.TODAY, owner: "顾文清" });
+  task = f.run("district", "task.create", { id: task.id, roomId: "S1-L1", kind: "修改后的检查", due: M.TODAY, owner: "顾文清" });
+  const check = f.run("admin", "check.create", { taskId: task.id, roomId: task.roomId, kind: task.kind, date: M.TODAY, items: "检查项目", result: "正常", note: "" });
+  f.run("admin", "check.update", { id: check.id, roomId: task.roomId, kind: task.kind, date: M.TODAY, items: "更正检查项目", result: "发现隐患", note: "", title: "测试隐患", owner: "顾文清", level: "一般关注", due: M.TODAY });
+  const hazard = f.db.hazards.find(row => row.checkId === check.id);
+  f.run("admin", "hazard.update", { id: hazard.id, title: "更正后的隐患", owner: "顾文清", level: "需优先处理", due: M.TODAY, note: "" });
+  f.run("admin", "hazard.delete", { id: hazard.id, reason: "确认误报" });
+  assert.equal(get(f.db, "checks", check.id).result, "正常");
+  f.run("admin", "check.delete", { id: check.id, reason: "测试删除" });
+  assert.equal(get(f.db, "tasks", task.id).state, "待检查");
+  f.run("district", "inspection-task.delete", { id: task.id, reason: "测试删除" });
+
+  const file = f.run("admin", "archive.create", { relatedTable: "assets", relatedId: "S1-A1", name: "待修改.txt", category: "设备建设", content: "原内容", dataUrl: "", mime: "text/plain", archive: false });
+  f.run("admin", "archive.update", { id: file.id, name: "已修改.txt", category: "设备建设", content: "新内容" });
+  assert.equal(get(f.db, "archives", file.id).content, "新内容");
+  f.run("admin", "archive.delete", { id: file.id, reason: "测试删除" });
+  assert.deepEqual(M.auditRelations(f.db), []);
 });
 
 test("教师可为本人创建或本人任务关联的计划上传附件", () => {
   const f = fixture(), attachment = f.run("teacher", "archive.create", { relatedTable: "plans", relatedId: "S1-P1", name: "物理计划说明.txt", category: "实验教学", content: "计划执行说明", dataUrl: "", mime: "text/plain", archive: false }, "S1-T1");
   assert.equal(attachment.relatedId, "S1-P1");
   f.reject("teacher", "archive.create", { relatedTable: "plans", relatedId: "S1-P1", name: "无关学科计划.txt", category: "实验教学", content: "不应上传", dataUrl: "", mime: "text/plain", archive: false }, /教师只能上传本人业务资料/, "S1-T2");
+});
+
+test("教学资源上传即入库并支持教师本人维护与管理员维护", () => {
+  const f = fixture();
+  const created = f.run("teacher", "resource.create", { resourceType: "课件", subject: "物理", grades: ["高一", "高二"], experimentCategory: "创新实验", title: "牛顿第二定律课件", description: "课堂讲解与探究活动", originalName: "newton.pptx", mime: "application/vnd.openxmlformats-officedocument.presentationml.presentation", size: 2048, content: "课件文本摘要" }, "S1-T1");
+  assert.ok(get(f.db, "resources", created.id), "教师上传后应直接出现在资源库");
+  assert.deepEqual(get(f.db, "resources", created.id).grades, ["高一", "高二"]);
+  f.run("teacher", "resource.update", { id: created.id, resourceType: "课件", subject: "物理", grades: ["高一"], experimentCategory: "必做", title: "牛顿第二定律课件（修订）", description: "修订版", content: "修订内容" }, "S1-T1");
+  assert.equal(get(f.db, "resources", created.id).title, "牛顿第二定律课件（修订）");
+  f.reject("teacher", "resource.update", { id: created.id, resourceType: "课件", subject: "物理", grades: ["高一"], experimentCategory: "必做", title: "越权修改", content: "不应写入" }, /教师只能修改本人上传的资源。/, "S1-T2");
+  f.run("admin", "resource.update", { id: created.id, resourceType: "课件", subject: "物理", grades: ["高一"], experimentCategory: "选做", title: "管理员修订", content: "管理员修订内容" }, "S1-T0");
+  assert.equal(get(f.db, "resources", created.id).experimentCategory, "选做");
+  f.run("admin", "resource.delete", { id: created.id, reason: "测试清理" }, "S1-T0");
+  assert.equal(f.db.resources.some(row => row.id === created.id), false);
+  assert.deepEqual(M.auditRelations(f.db), []);
+});
+
+test("教师写入按专业学科或当前学期有效任课授权，计划拒绝跨学科实验来源", () => {
+  const resource = { resourceType: "课件", subject: "化学", grades: ["高一"], experimentCategory: "必做", title: "跨学科越权资源", description: "", originalName: "forbidden.txt", mime: "text/plain", size: 8, content: "forbidden", term: "TERM26" };
+  const f = fixture();
+  f.reject("teacher", "resource.create", resource, /教师只能维护本人专业学科/, "S1-T1");
+  f.reject("teacher", "customExperiment.save", { name: "跨学科越权实验", code: "FORBIDDEN-CX", subject: "化学", grade: "高一", textbookId: "TB-HX-01", term: "TERM26", supportedModes: ["分组"], equipmentRequirements: [{ name: "烧杯", unit: "个", quantity: 1 }] }, /教师只能维护本人专业学科/, "S1-T1");
+
+  const comprehensiveSeed = M.seed(), scienceTeacher = get(comprehensiveSeed, "staff", "S1-T5");
+  scienceTeacher.subject = "综合";
+  M.normalizeSubjectFields(comprehensiveSeed);
+  const comprehensive = fixture(comprehensiveSeed);
+  comprehensive.reject("teacher", "resource.create", { ...resource, subject: "物理" }, /综合教师须具备当前学期对应学科的有效任课关系/, "S1-T5");
+  const allowed = comprehensive.run("teacher", "resource.create", { ...resource, subject: "科学", title: "综合教师科学资源", originalName: "science.txt", content: "science" }, "S1-T5");
+  assert.equal(allowed.subjectCode, "SCI");
+  comprehensive.reject("teacher", "resource.delete", { id: allowed.id, reason: "错误学期删除", term: "TERM25" }, /综合教师须具备当前学期对应学科的有效任课关系/, "S1-T5");
+  comprehensive.run("teacher", "resource.delete", { id: allowed.id, reason: "当前学期删除", term: "TERM26" }, "S1-T5");
+
+  const custom = f.run("admin", "customExperiment.save", { name: "化学自定义实验来源", code: "CHEM-CX-SOURCE", subject: "化学", grade: "高一", textbookId: "TB-HX-01", supportedModes: ["分组"], equipmentRequirements: [{ name: "烧杯", unit: "个", quantity: 1 }] });
+  f.reject("admin", "plan.compile", { term: "TERM26", subject: "物理", grade: "高一", textbookId: "TB-WL-01", name: "跨学科来源注入计划", classIds: ["S1-C2"], items: [{ sourceType: "学校自定义", sourceId: custom.id, mode: "分组", scheduleType: "WEEK", plannedWeek: 4 }] }, /自定义实验与当前学科、年级或教材不匹配/);
 });
 
 function legacyV2() {
@@ -765,7 +976,7 @@ function legacyV2() {
   };
 }
 
-test("v2数据可迁移为v9且保留房间、任课、计划任务和完成总结", () => {
+test("v2数据可迁移为v11且保留房间、任课、计划任务和完成总结", () => {
   const migrated = M.migrate(legacyV2());
   assert.equal(migrated.version, M.VERSION);
   assert.equal(migrated.labs, undefined);
@@ -777,6 +988,9 @@ test("v2数据可迁移为v9且保留房间、任课、计划任务和完成总�
   assert.equal(migrated.plans.length, 1);
   assert.equal(migrated.planItems.length, 1);
   assert.equal(migrated.catalog, undefined, "迁移后移除独立实验目录");
+  assert.equal(migrated.textbooks.length, 1, "旧版教材应迁移为新版教材档案");
+  assert.equal(migrated.experimentCatalog.length, 1, "旧版实验目录应迁移为官方实验目录");
+  assert.equal(migrated.planItems[0].sourceType, "官方目录");
   assert.equal(migrated.planItems[0].experimentName, "测量物体的速度");
   assert.equal(migrated.planItems[0].equipment, "小车、刻度尺");
   assert.equal(migrated.teachingTasks.length, 1);
@@ -789,15 +1003,114 @@ test("v2数据可迁移为v9且保留房间、任课、计划任务和完成总�
   assert.equal(migrated.arrangements.length, 1);
   assert.equal(get(migrated, "staff", "S1-T4").role, "admin");
   assert.equal(migrated.summaries.length, 1);
+  for (const row of [migrated.plans[0], migrated.planItems[0], migrated.teachingTasks[0], migrated.bookings[0], migrated.arrangements[0], migrated.summaries[0]]) {
+    assert.equal(row.subject, "物理", `${row.id}应继承物理学科`);
+    assert.equal(row.subjectCode, "PHY", `${row.id}应补齐PHY编码`);
+  }
   assert.ok(migrated.periods.every(period => period.term), "migrated periods must be term-scoped");
   assert.equal(M.periodFor(migrated, "S1", 1, "TERM26").id, "S1-K1");
   assert.equal(migrated.assets[0].roomId, "S1-L1");
+  assert.equal(migrated.assets[0].sourceId, "", "旧入库单不存在时清除悬空来源引用");
   assert.equal(Object.hasOwn(migrated.assets[0], "labId"), false);
   assert.equal(Object.hasOwn(migrated.inventory[0], "opening"), false);
   assert.equal(migrated.itemCatalog, undefined, "迁移后取消独立物品目录");
   assert.ok(migrated.logs.some(log => log.action === "数据结构升级"));
-  assert.deepEqual(M.migrate(migrated), migrated, "migrating v9 is idempotent");
-  assert.throws(() => M.migrate({ version: 1 }), /仅支持从v2\/v3\/v4\/v5\/v6\/v7\/v8升级到当前版本/);
+  assert.deepEqual(M.auditRelations(migrated), [], "迁移后不应保留悬空引用或失配状态");
+  assert.deepEqual(M.migrate(migrated), migrated, "migrating v11 is idempotent");
+  assert.throws(() => M.migrate({ version: 1 }), /仅支持从v2至v10升级到当前版本/);
+});
+
+test("同版本v11也会归一学科别名、修正编码并按上游覆盖漂移", () => {
+  const raw = M.seed(), biologyPlan = get(raw, "plans", "S1-P3"), biologyItem = get(raw, "planItems", "S1-P3-I1"), biologyTask = raw.teachingTasks.find(row => row.planItemId === biologyItem.id), booking = get(raw, "bookings", "S1-YY1"), arrangement = raw.arrangements.find(row => row.bookingId === booking.id);
+  biologyPlan.subject = "生命科学"; biologyPlan.subjectCode = "WRONG";
+  biologyItem.subject = "物理"; biologyItem.subjectCode = "PHY";
+  biologyTask.subject = "化学"; biologyTask.subjectCode = "CHEM";
+  get(raw, "rooms", "S1-L3").subject = "生物学";
+  get(raw, "textbooks", "TB-SW-01").subject = "生物学";
+  raw.resources.find(row => row.subject === "生物").subject = "生命科学";
+  booking.subject = "化学"; booking.subjectCode = "CHEM";
+  arrangement.subject = "化学"; arrangement.subjectCode = "CHEM";
+  const migrated = M.migrate(raw);
+  for (const row of [get(migrated, "plans", biologyPlan.id), get(migrated, "planItems", biologyItem.id), get(migrated, "teachingTasks", biologyTask.id)]) {
+    assert.equal(row.subject, "生物");
+    assert.equal(row.subjectCode, "BIO");
+  }
+  assert.equal(get(migrated, "rooms", "S1-L3").subject, "生物");
+  assert.equal(get(migrated, "rooms", "S1-L3").subjectCode, "BIO");
+  assert.equal(get(migrated, "bookings", booking.id).subject, "物理");
+  assert.equal(get(migrated, "bookings", booking.id).subjectCode, "PHY");
+  assert.equal(get(migrated, "arrangements", arrangement.id).subject, "物理");
+  assert.equal(get(migrated, "arrangements", arrangement.id).subjectCode, "PHY");
+  assert.deepEqual(M.auditRelations(migrated), []);
+  assert.deepEqual(M.migrate(migrated), migrated, "同版本学科归一应保持幂等");
+});
+
+test("早期v11三学科样例会幂等补齐科学业务链", () => {
+  const old = M.seed(), sciencePlanIds = new Set(old.plans.filter(row => row.subject === "科学").map(row => row.id)), scienceItemIds = new Set(old.planItems.filter(row => sciencePlanIds.has(row.planId)).map(row => row.id));
+  delete old.subjectModelVersion;
+  old.staff = old.staff.filter(row => row.subject !== "科学");
+  old.rooms = old.rooms.filter(row => row.subject !== "科学");
+  old.assignments = old.assignments.filter(row => row.subject !== "科学");
+  old.plans = old.plans.filter(row => !sciencePlanIds.has(row.id));
+  old.planTargets = old.planTargets.filter(row => !sciencePlanIds.has(row.planId));
+  old.planItems = old.planItems.filter(row => !scienceItemIds.has(row.id));
+  old.teachingTasks = old.teachingTasks.filter(row => !scienceItemIds.has(row.planItemId));
+  old.textbooks = old.textbooks.filter(row => row.subject !== "科学");
+  old.experimentCatalog = old.experimentCatalog.filter(row => row.subject !== "科学");
+  old.resources = old.resources.filter(row => row.subject !== "科学");
+  old.assets = old.assets.filter(row => row.category !== "科学仪器");
+  old.receipts.forEach(receipt => { receipt.items = receipt.items.filter(row => row.category !== "科学仪器"); });
+  const migrated = M.migrate(old);
+  assert.equal(migrated.subjectModelVersion, 1);
+  assert.equal(migrated.staff.filter(row => row.subject === "科学").length, 3);
+  assert.equal(migrated.rooms.filter(row => row.subject === "科学" && row.type === "教学实验室").length, 3);
+  assert.equal(migrated.assignments.filter(row => row.subject === "科学").length, 18);
+  assert.equal(migrated.plans.filter(row => row.subject === "科学").length, 3);
+  assert.equal(migrated.teachingTasks.filter(row => row.subject === "科学").length, 6);
+  assert.equal(migrated.assets.filter(row => row.category === "科学仪器").length, 3);
+  assert.deepEqual(M.auditRelations(migrated), []);
+  assert.deepEqual(M.migrate(migrated), migrated, "科学样例补齐不可重复执行");
+});
+
+test("已迁移v11缺少教材目录时可从计划快照恢复编制数据", () => {
+  const raw = M.seed();
+  delete raw.subjectModelVersion;
+  raw.classes = raw.classes.filter(row => row.grade === "高一");
+  raw.assignments = raw.assignments.filter(row => raw.classes.some(klass => klass.id === row.classId));
+  raw.plans.forEach(plan => { plan.name = `${plan.subject}实验计划`; });
+  delete raw.textbooks;
+  delete raw.experimentCatalog;
+  raw.plans.forEach(plan => { delete plan.textbookId; });
+  raw.planItems.forEach(item => { item.sourceType = "历史来源"; item.sourceId = ""; delete item.textbookId; });
+  const repaired = M.migrate(raw);
+  assert.ok(repaired.textbooks.length > 0, "应恢复教材档案");
+  assert.ok(repaired.experimentCatalog.length > 0, "应恢复官方实验目录");
+  assert.ok(repaired.planItems.every(item => item.sourceType === "官方目录" && item.sourceId), "计划项应重新绑定官方目录");
+  assert.deepEqual([...new Set(repaired.classes.filter(row => row.school === "S1").map(row => row.grade))], ["高一", "高二", "高三"], "旧版本地数据应补齐其他年级班级");
+  assert.equal(repaired.classes.filter(row => row.school === "S1" && row.grade === "高二").length, 2, "高二应补齐两个示例班级");
+  assert.equal(repaired.classes.filter(row => row.school === "S1" && row.grade === "高三").length, 2, "高三应补齐两个示例班级");
+  assert.ok(repaired.plans.every(plan => new RegExp(`^${repaired.terms[0].name} · 高一(${M.subjects.map(M.subjectLabel).join("|")})实验计划$`).test(plan.name)), "旧样例计划名称应升级为四学科统一格式");
+  assert.deepEqual(M.auditRelations(repaired), []);
+  const userEdited = M.clone(repaired);
+  userEdited.classes = userEdited.classes.filter(row => row.id !== "S1-C3");
+  userEdited.assignments = userEdited.assignments.filter(row => row.classId !== "S1-C3");
+  const reopened = M.migrate(userEdited);
+  assert.equal(reopened.classes.some(row => row.id === "S1-C3"), false, "已完成补齐标记后不应重建用户删除的示例班级");
+  assert.equal(reopened.assignments.some(row => row.classId === "S1-C3"), false, "已完成补齐标记后不应重建用户删除的任课关系");
+  assert.deepEqual(M.auditRelations(reopened), []);
+});
+
+test("旧版待复核易耗品损耗升级为直接登记并同步库存", () => {
+  const legacy = M.seed(), stock = get(legacy, "inventory", "S1-I2"), before = stock.stock;
+  legacy.version = 9;
+  legacy.flows.unshift({ id: "LEGACY-LOSS-PENDING", school: "S1", itemId: stock.id, kind: "损耗", qty: 2, date: M.TODAY, reason: "历史待复核损耗", applicant: "顾文清", applicantId: "S1-T0", reviewer: "", state: "待复核", snapshot: { itemId: stock.itemId, classificationCode: stock.classificationCode, name: stock.name, spec: stock.spec, unit: stock.unit, roomId: stock.roomId } });
+  legacy.flows.unshift({ id: "LEGACY-LOSS-REJECTED", school: "S1", itemId: stock.id, kind: "损耗", qty: 1, date: M.TODAY, reason: "历史已驳回损耗", applicant: "顾文清", applicantId: "S1-T0", reviewer: "陈小红", state: "已驳回", snapshot: { itemId: stock.itemId, classificationCode: stock.classificationCode, name: stock.name, spec: stock.spec, unit: stock.unit, roomId: stock.roomId } });
+  const migrated = M.migrate(legacy), migratedLoss = get(migrated, "flows", "LEGACY-LOSS-PENDING");
+  assert.equal(get(migrated, "inventory", stock.id).stock, before - 2);
+  assert.equal(migratedLoss.operator, "顾文清");
+  assert.equal(Object.hasOwn(migratedLoss, "state"), false);
+  assert.equal(migrated.flows.some(flow => flow.id === "LEGACY-LOSS-REJECTED"), false);
+  assert.deepEqual(M.migrate(migrated), migrated, "直接登记迁移不可重复扣减库存");
 });
 
 test("历史人员培训数据迁移后不再保留", () => {
@@ -866,7 +1179,7 @@ test("v5历史已准备状态迁移为已安排并保留说明", () => {
 });
 
 test("CSV导入字段与设备/耗材入库表单一致，并直接保存物品信息", () => {
-  const db = M.seed(), row = ["NEW-IMPORT-001", "新型光电门", "G1", "物理仪器", "套", "单件设备", "是", 2, 450, "A202", "2027-02-28", ""], source = M.csv([M.importHeader, row]), parsed = M.validateImport(source, db, "S1");
+  const db = M.seed(), row = ["NEW-IMPORT-001", "新型光电门", "G1", "物理仪器", "套", "单件设备", "是", 2, 450, "A202", "P01", "2027-02-28", ""], source = M.csv([M.importHeader, row]), parsed = M.validateImport(source, db, "S1");
  assert.deepEqual(parsed.errors, []);
   assert.equal(parsed.items[0].itemId, "NEW-IMPORT-001");
   assert.equal(parsed.items[0].name, "新型光电门");
@@ -876,18 +1189,19 @@ test("CSV导入字段与设备/耗材入库表单一致，并直接保存物品�
   assert.equal(parsed.items[0].trackingMode, "SERIALIZED");
   assert.equal(parsed.items[0].maintenanceRequired, true);
   assert.equal(parsed.items[0].qty, 2);
-  assert.equal(parsed.items[0].price, 450);
+ assert.equal(parsed.items[0].price, 450);
  assert.equal(parsed.items[0].roomId, "S1-R4");
+ assert.equal(parsed.items[0].cabinetId, "S1-CAB-P01");
  assert.equal(parsed.items[0].nextMaintenance, "2027-02-28");
-  assert.deepEqual(M.importHeader, ["分类编号", "物品名称", "规格型号", "分类", "单位", "管理方式", "需要周期维保", "数量", "单价（元）", "存放位置（房间）", "下次维保日期", "有效期"]);
+  assert.deepEqual(M.importHeader, ["分类编号", "物品名称", "规格型号", "分类", "单位", "管理方式", "需要周期维保", "数量", "单价（元）", "存放位置（房间）", "橱柜编号（可选）", "下次维保日期", "有效期"]);
   const incompatible = M.validateImport(M.csv([M.importHeader, [...row.slice(0, 9), "B201", ...row.slice(10)]]), db, "S1");
  assert.ok(incompatible.errors.some(message => /与存放房间学科不一致/.test(message)));
  get(db, "rooms", "S1-R4").state = "停用";
  const stopped = M.validateImport(source, db, "S1");
  assert.ok(stopped.errors.some(message => /存放房间已停用/.test(message)));
-  const invalid = M.validateImport(M.csv([M.importHeader, ["NEW-CONSUMABLE", "载玻片", "7101型", "耗材", "盒", "数量库存", "否", 1, 10, "A201", "2027-02-28", ""]]), db, "S1");
+  const invalid = M.validateImport(M.csv([M.importHeader, ["NEW-CONSUMABLE", "载玻片", "7101型", "耗材", "盒", "数量库存", "否", 1, 10, "A201", "", "2027-02-28", ""]]), db, "S1");
  assert.ok(invalid.errors.some(message => /不需要维保日期/.test(message)));
-  const hazardWithoutExpiry = M.validateImport(M.csv([M.importHeader, ["NEW-HAZARD", "新危化品", "500mL", "危化品", "瓶", "数量库存", "否", 1, 15, "B201", "", ""]]), db, "S1");
+  const hazardWithoutExpiry = M.validateImport(M.csv([M.importHeader, ["NEW-HAZARD", "新危化品", "500mL", "危化品", "瓶", "数量库存", "否", 1, 15, "B201", "", "", ""]]), db, "S1");
  assert.ok(hazardWithoutExpiry.errors.some(message => /危化品须登记未过期的有效期/.test(message)));
   const receiptFixture = fixture(), receipt = receiptFixture.run("admin", "receipt.create", { supplier: "测试供应商", date: M.TODAY, purchaseDate: M.TODAY, note: "", items: parsed.items });
   assert.equal(receipt.items[0].name, "新型光电门");
@@ -895,15 +1209,60 @@ test("CSV导入字段与设备/耗材入库表单一致，并直接保存物品�
  assert.throws(() => M.validateImport(M.csv([["名称", "规格", "数量"], ["旧模板", "X", 1]]), db, "S1"), /模板表头/);
 });
 
+test("四学科字典、显示别名和器材兼容范围稳定", () => {
+  assert.deepEqual(M.subjectCodes, ["SCI", "PHY", "CHEM", "BIO"]);
+  assert.equal(M.normalizeSubject("生物学"), "生物");
+  assert.equal(M.subjectLabel("生物"), "生物学");
+  assert.equal(M.subjectCode("生命科学"), "BIO");
+  assert.equal(M.itemFitsSubject({ category: "科学仪器" }, "科学"), true);
+  assert.equal(M.itemFitsSubject({ category: "科学仪器" }, "物理"), false);
+  assert.equal(M.itemFitsSubject({ category: "危化品" }, "物理"), false);
+  assert.equal(M.itemFitsSubject({ category: "耗材", subjectScopes: ["物理", "生物学"] }, "生物"), true);
+  const seed = M.seed();
+  assert.deepEqual({ schools: seed.schools.length, staff: seed.staff.length, rooms: seed.rooms.length, teachingLabs: seed.rooms.filter(row => row.type === "教学实验室").length, classes: seed.classes.length, assignments: seed.assignments.length, periods: seed.periods.length, assets: seed.assets.length, inventory: seed.inventory.length, plans: seed.plans.length, planItems: seed.planItems.length, teachingTasks: seed.teachingTasks.length, bookings: seed.bookings.length, arrangements: seed.arrangements.length, resources: seed.resources.length }, { schools: 3, staff: 18, rooms: 15, teachingLabs: 12, classes: 18, assignments: 72, periods: 48, assets: 21, inventory: 12, plans: 12, planItems: 18, teachingTasks: 36, bookings: 3, arrangements: 1, resources: 7 });
+  assert.ok(seed.experimentCatalog.some(row => row.subject === "科学"));
+  assert.ok(seed.resources.some(row => row.subject === "科学"));
+  for (const subject of M.subjects) {
+    const code = M.subjectCode(subject);
+    assert.ok(seed.staff.some(row => row.role === "teacher" && row.subject === subject && row.subjectCode === code), `${subject}应有教师`);
+    assert.ok(seed.rooms.some(row => row.type === "教学实验室" && row.subject === subject && row.subjectCode === code), `${subject}应有教学实验室`);
+    assert.ok(seed.assignments.some(row => row.subject === subject && row.subjectCode === code), `${subject}应有任课关系`);
+    assert.ok(seed.plans.some(row => row.subject === subject && row.subjectCode === code), `${subject}应有实验计划`);
+    assert.ok(seed.teachingTasks.some(row => row.subject === subject && row.subjectCode === code), `${subject}应有班级实验任务`);
+    assert.ok(M.metrics(seed, "S1", "TERM26", subject).required > 0, `${subject}应进入独立统计口径`);
+  }
+  assert.deepEqual(M.auditRelations(seed), []);
+});
+
 test("导航目标存在且区级、学校各角色的所有页面标签均可渲染", () => {
-  for (const [scope, groups] of Object.entries(M.navigation)) for (const group of groups) for (const item of group.items) assert.ok(fs.existsSync(path.join(__dirname, "../pages", scope, item.href)), `${scope}/${item.href}`);
+  assert.deepEqual(M.navigation.district.map(group => [group.label, ...group.items.map(item => item.label)]), [
+    ["工作台", "区域总览", "智能问数"],
+    ["组织与配置", "学校与上报", "人员与任课", "基础数据与设置"],
+    ["教学监管", "实验计划监管", "实验开出统计"],
+    ["资产监管", "设备资产", "易耗品账目", "维修与报废"],
+    ["安全监管", "危化品安全监管"]
+  ]);
+  assert.deepEqual(M.navigation.school.map(group => [group.label, ...group.items.map(item => item.label)]), [
+    ["工作台", "学校总览", "智能问数", "教学资源库"],
+    ["教学运行", "实验计划", "预约与安排"],
+    ["资产物资", "设备与入库", "易耗品账目", "维修与报废"],
+    ["安全管理", "危化品安全管理"],
+    ["基础设置", "实验室档案", "人员与班级"]
+  ]);
+  assert.deepEqual(M.navigationFor("school", "admin").flatMap(group => group.items.map(item => item.id)), M.navigation.school.flatMap(group => group.items.map(item => item.id)));
+  assert.deepEqual(M.navigationFor("school", "teacher").flatMap(group => group.items.map(item => item.id)), ["dashboard", "ai-query", "archives", "experiments", "booking", "devices", "supplies", "repair"]);
+  for (const [scope, groups] of Object.entries(M.navigation)) for (const group of groups) for (const item of group.items) {
+    const target = path.join(__dirname, "../pages", scope, item.href);
+    assert.ok(fs.existsSync(target), `${scope}/${item.href}`);
+    assert.ok(fs.readFileSync(target, "utf8").includes(`<title>${item.label}</title>`), `${scope}/${item.href}标题须与菜单一致`);
+  }
   const source = fs.readFileSync(path.join(__dirname, "../assets/app.js"), "utf8");
   const tabs = {
-    schools: ["schools", "rooms", "submissions"], teachers: ["all", "teacher", "admin", "disabled"], staff: ["all", "teacher", "admin", "classes", "disabled"],
-    labs: ["rooms"], equipment: ["assets", "receipts", "purchases"], devices: ["assets", "receipts", "purchases"],
-    supplies: ["stock", "hazard", "inbound", "outbound", "loss", "pending"], consumables: ["stock", "hazard", "inbound", "outbound", "loss", "pending"], maintenance: ["repair", "scrap", "purchase", "plan", "history"], repair: ["repair", "scrap", "purchase", "plan", "history"],
+    schools: ["schools", "rooms", "cabinets", "submissions"], teachers: ["all", "teacher", "admin", "disabled"], staff: ["all", "teacher", "admin", "classes", "disabled"],
+    labs: ["rooms", "cabinets"], equipment: ["assets", "receipts", "purchases"], devices: ["assets", "receipts", "purchases"],
+    supplies: ["total", "ledger", "loss"], consumables: ["total", "ledger", "loss"], maintenance: ["repair", "scrap"], repair: ["repair", "scrap"],
     experiments: ["plans", "tasks", "mine"], booking: ["booked", "arranged", "pendingSummary", "mineBooked", "mineArranged", "minePendingSummary"], schedule: ["progress", "ranking", "subject", "grade", "class"], safety: ["hazards", "checks", "tasks"],
-    settings: ["settings", "terms", "periods", "logs"], archives: ["all", "实验教学", "安全管理", "人员档案", "设备建设"]
+    settings: ["settings", "terms", "periods", "logs"], archives: ["all", "教学设计", "教案", "学案", "课件", "实验视频", "学习单"]
   };
   let rendered = 0;
   assert.doesNotMatch(source, /\["assignments", "任课关系"\]/, "人员管理不再单列任课关系页签");
@@ -911,10 +1270,15 @@ test("导航目标存在且区级、学校各角色的所有页面标签均可�
   assert.doesNotMatch(source, /roomAssignments\s*:/, "数据模型不再声明额外人员关系表");
   assert.doesNotMatch(source, /table === ["']roomAssignments["']/, "业务操作不再提供额外人员关系表单");
   assert.match(source, /设置任课班级/, "任课教师列表提供任课班级设置入口");
+  assert.match(source, /scope !== "school" && schoolTables\.includes\(table\)/, "学校端基础表单不展示所属学校字段");
+  assert.match(source, /schoolScopeColumns\(rawColumns\)/, "学校端列表按当前账号范围隐藏学校列");
+  for (const label of ["易耗品总账", "易耗品分类账", "易耗品损耗登记", "仪器设备维修", "仪器设备报废"]) assert.match(source, new RegExp(label), `参考系统页签：${label}`);
+  for (const label of ["classificationCode:分类编号", "maintenanceDate:维修日期", "scrapDate:报废日期", "date:损耗日期", "operator:经办人", "location:房间或橱柜"]) assert.match(source, new RegExp(label), `参考列表字段：${label}`);
+  assert.match(source, /schoolScopeFields\.has\(k\)/, "学校端详情不展示所属学校字段");
   for (const role of ["district", "admin", "teacher"]) {
     const scope = role === "district" ? "district" : "school", seed = M.seed(), actor = M.actorFor(seed, role, "S1");
     for (const page of M.navigation[scope].flatMap(group => group.items)) {
-      const pageTabs = page.id === "experiments" && scope === "district" ? ["all", "required", "optional"] : tabs[page.id] || [""];
+      const pageTabs = page.id === "experiments" && scope === "district" ? ["plans", "tasks"] : tabs[page.id] || [""];
       for (const tab of pageTabs) {
         const app = { innerHTML: "" }, storage = new Map([[M.KEY, JSON.stringify(seed)]]), preferences = new Map([["lab-demo-identity", JSON.stringify({ role, school: "S1", personId: actor.id })]]);
         const store = map => ({ getItem: key => map.get(key) || null, setItem: (key, value) => map.set(key, value) });
@@ -927,8 +1291,35 @@ test("导航目标存在且区级、学校各角色的所有页面标签均可�
       }
     }
   }
-  assert.ok(rendered >= 110, "合并实验员后按三种当前身份覆盖页面渲染");
+  for (const [page, tabsForPage] of [["devices", ["assets", "receipts", "purchases"]], ["supplies", ["total", "ledger", "loss"]], ["repair", ["repair", "scrap"]]]) {
+    const seed = M.seed(), actor = M.actorFor(seed, "admin", "S1");
+    for (const tab of tabsForPage) {
+      const app = { innerHTML: "" }, storage = new Map([[M.KEY, JSON.stringify(seed)]]), preferences = new Map([["lab-demo-identity", JSON.stringify({ role: "admin", school: "S1", personId: actor.id })]]);
+      const store = map => ({ getItem: key => map.get(key) || null, setItem: (key, value) => map.set(key, value) });
+      const document = { documentElement: { dataset: {} }, body: { dataset: { scope: "school", page } }, title: "", getElementById: id => id === "app" ? app : null, addEventListener() {}, querySelector() { return null; }, querySelectorAll() { return []; } };
+      const window = { LabDemo: M, addEventListener() {} };
+      vm.runInNewContext(source, { window, document, localStorage: store(storage), sessionStorage: store(preferences), location: { search: `?tab=${encodeURIComponent(tab)}` }, URLSearchParams, Blob, console, setTimeout });
+      assert.doesNotMatch(app.innerHTML, /<th scope="col">学校<\/th>/, `学校端${page}/${tab}不显示学校列`);
+    }
+  }
+  const scopedSeed = M.seed();
+  const biologyOnlyLine = { itemId: "BIO-ONLY-ITEM", classificationCode: "BIO-ONLY", name: "仅生物观察仪", spec: "BIO-X", category: "生物仪器", unit: "台", trackingMode: "SERIALIZED", maintenanceRequired: false, qty: 1, price: 1, roomId: "S1-L3" };
+  scopedSeed.purchases.unshift({ id: "BIO-ONLY-PURCHASE", school: "S1", purpose: "仅生物学设备", applicant: "顾文清", date: M.TODAY, state: "待审核", items: [biologyOnlyLine] });
+  scopedSeed.receipts.unshift({ id: "BIO-ONLY-RECEIPT", school: "S1", purchaseId: "", date: M.TODAY, purchaseDate: M.TODAY, supplier: "测试供应商", operator: "顾文清", state: "已入库", note: "", items: [biologyOnlyLine] });
+  const renderScoped = (tab, subject) => {
+    const app = { innerHTML: "" }, storage = new Map([[M.KEY, JSON.stringify(scopedSeed)]]), actor = M.actorFor(scopedSeed, "admin", "S1"), preferences = new Map([["lab-demo-seed-active", "true"], ["lab-demo-identity", JSON.stringify({ role: "admin", school: "S1", personId: actor.id })], ["lab-demo-subject:school:S1:S1-T0", JSON.stringify(subject)]]);
+    const store = map => ({ getItem: key => map.get(key) || null, setItem: (key, value) => map.set(key, value) });
+    const document = { documentElement: { dataset: {} }, body: { dataset: { scope: "school", page: "devices" } }, title: "", getElementById: id => id === "app" ? app : null, addEventListener() {}, querySelector() { return null; }, querySelectorAll() { return []; } };
+    const window = { LabDemo: M, addEventListener() {} };
+    vm.runInNewContext(source, { window, document, localStorage: store(storage), sessionStorage: store(preferences), location: { search: `?tab=${encodeURIComponent(tab)}` }, URLSearchParams, Blob, console, setTimeout, performance: { getEntriesByType: () => [] } });
+    return app.innerHTML;
+  };
+  for (const tab of ["purchases", "receipts"]) {
+    assert.doesNotMatch(renderScoped(tab, "物理"), /仅生物观察仪/, `物理范围下${tab}不应显示纯生物采购记录`);
+    assert.match(renderScoped(tab, "生物学"), /仅生物观察仪/, `生物学范围下${tab}应显示匹配记录`);
+  }
+  assert.ok(rendered >= 95, "合并实验员后按三种当前身份覆盖页面渲染");
   console.log(`  ${rendered} role/page/tab renders checked`);
 });
 
-console.log(`\n${checks} suites passed. v9 business relations, closed loops, migration and rendering verified.`);
+console.log(`\n${checks} suites passed. v12 business relations, teaching resources, migration and rendering verified.`);

@@ -15,7 +15,7 @@
       items: group.items.map((item) => ({ label: item.label, path: `pages/district/${item.href}`, code: `D-${item.mark}` }))
     })),
     ...data.navigation.school.map((group) => ({
-      label: `学校端 · ${group.label}`,
+      label: `学校管理端 · ${group.label}`,
       items: group.items.map((item) => ({ label: item.label, path: `pages/school/${item.href}`, code: `S-${item.mark}` }))
     }))
   ];

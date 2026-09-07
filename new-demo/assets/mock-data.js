@@ -353,6 +353,12 @@
         db.rooms.filter(room => room.type !== "普通教室").forEach(room => db.cabinets.push({ id: `MIG-CAB-${room.id}`, school: room.school, roomId: room.id, code: `MIG-${room.roomNo || room.id}`, name: "默认存放柜", type: room.hazardStorage ? "危化品专用柜" : "其他", state: "启用", custodianId: db.staff?.find(person => person.school === room.school && person.role === "admin" && person.enabled)?.id || "", hazardStorage: room.hazardStorage === true, note: "由历史数据迁移生成，可按学校实际柜位调整。", legacy: true }));
       }
       const validCabinetIds = new Set(db.cabinets.filter(cabinet => cabinet.id && cabinet.school && db.schools.some(school => school.id === cabinet.school) && db.rooms.some(room => room.id === cabinet.roomId && room.school === cabinet.school)).map(cabinet => cabinet.id));
+    ["tasks", "checks", "hazards"].forEach(table => (db[table] || []).forEach(row => {
+      if (row.targetType !== "cabinet" || validCabinetIds.has(row.targetId)) return;
+      const replacement = db.cabinets.find(cabinet => cabinet.school === row.school && cabinet.roomId === row.roomId && (row.safetyScope !== "hazardous" || cabinet.hazardStorage === true));
+      if (replacement) row.targetId = replacement.id;
+      else { row.targetType = "room"; row.targetId = row.roomId; }
+    }));
     ["assets", "inventory"].forEach(table => (db[table] || []).forEach(row => { if (!validCabinetIds.has(row.cabinetId)) delete row.cabinetId; }));
     ["purchases", "receipts"].forEach(table => (db[table] || []).forEach(document => (document.items || []).forEach(row => { if (!validCabinetIds.has(row.cabinetId)) delete row.cabinetId; })));
     (db.flows || []).forEach(flow => { if (flow.snapshot && !validCabinetIds.has(flow.snapshot.cabinetId)) delete flow.snapshot.cabinetId; });
@@ -365,9 +371,10 @@
     must(room.school === target.school, "检查对象与存放房间学校不一致。");
     must(!input.roomId || input.roomId === roomId, "检查对象与所选房间不一致。");
     if (safetyScope === "hazardous") {
+      must(room.state === "可用", "危化品检查须选择当前可用的存放房间。");
       must(room.hazardStorage === true, "危化品检查须选择具备危化品存放条件的房间。");
       if (targetType === "inventory") must(isHazard(itemOf(db, target)) && !target.pendingReceiptCreated, "请选择正式登记的危化品库存。");
-      if (targetType === "cabinet") must(target.hazardStorage === true, "请选择具备危化品存放条件的专柜。");
+      if (targetType === "cabinet") must(target.state === "启用" && target.hazardStorage === true, "请选择当前启用且具备危化品存放条件的专柜。");
     } else must(targetType === "room", "一般安全检查按房间登记。");
     return { school: target.school, safetyScope, targetType, targetId, roomId };
   }
@@ -392,15 +399,25 @@
     return task;
   }
   function normalizeSafetyModel(db) {
-    ["tasks", "checks", "hazards"].forEach(table => { db[table] ||= []; db[table].forEach(row => {
+    const legacyModel = db.safetyModelVersion !== 1;
+    ["tasks", "checks", "hazards"].forEach(table => { db[table] ||= []; });
+    ["tasks", "checks"].forEach(table => db[table].forEach(row => {
       if (!row.safetyScope || !row.targetType || !row.targetId) Object.assign(row, { safetyScope: "general", targetType: "room", targetId: row.roomId || "" });
       if (table === "tasks") row.sourceType ||= "district";
-      if (table === "hazards") {
-        row.reviewHistory ||= []; row.submissionHistory ||= [];
-        if (row.state === "待复查") { row.state = "待校内复核"; row.migrationNote = "历史待复查转入校内复核，保留原整改材料。"; }
-        if (row.rectification && row.attachmentId && !row.submissionHistory.length) row.submissionHistory.push({ submitterId: row.submitterId || "", submitterName: row.submitterName || row.owner || "历史未登记", at: row.submittedAt || "", rectification: row.rectification, attachmentId: row.attachmentId, legacy: true });
+    }));
+    db.hazards.forEach(row => {
+      const check = db.checks.find(item => item.id === row.checkId);
+      if (!row.safetyScope || !row.targetType || !row.targetId) Object.assign(row, check ? { safetyScope: check.safetyScope, targetType: check.targetType, targetId: check.targetId, roomId: check.roomId } : { safetyScope: "general", targetType: "room", targetId: row.roomId || "" });
+      row.reviewHistory ||= [];
+      row.submissionHistory ||= [];
+      if (row.state === "待复查") {
+        const complete = !!row.rectification && !!row.attachmentId;
+        row.state = complete ? "待校内复核" : "整改中";
+        row.migrationNote = complete ? "历史待复查转入校内复核，保留原整改材料。" : "历史待复查缺少完整整改材料，转回整改中。";
       }
-    }); });
+      if (row.rectification && row.attachmentId && !row.submissionHistory.length) row.submissionHistory.push({ submitterId: row.submitterId || "", submitterName: row.submitterName || row.owner || "历史未登记", at: row.submittedAt || "", rectification: row.rectification, attachmentId: row.attachmentId, legacy: true });
+      if (legacyModel && row.state === "已关闭" && (!row.rectification || !row.attachmentId || !row.reviewHistory.length)) row.legacyClosed = true;
+    });
     db.checks.forEach(check => { if (db.hazards.some(row => row.checkId === check.id)) check.result = "发现隐患"; else if (check.result === "通过") check.result = "正常"; syncSafetyTask(db, check); });
     db.safetyModelVersion = 1;
     return db;
@@ -432,9 +449,14 @@
           hazard.submissionHistory.push({ submitterId: admin.id, submitterName: admin.name, at, rectification, attachmentId });
         }
         if (["待区级复查", "已关闭", "整改中"].includes(state)) {
-          const approve = state !== "整改中", reason = approve ? "核对整改材料及检查对象，校内复核通过。" : "驳回：请补充现场核对材料后重新提交。";
-          hazard.reviewHistory.push({ stage: "school", approve, result: approve ? "通过" : "驳回", reason, reviewerId: admin.id, reviewerName: admin.name, at });
-          Object.assign(hazard, { review: reason, reviewer: admin.name, reviewedAt: at });
+          const schoolReason = "核对整改材料及检查对象，校内复核通过。";
+          hazard.reviewHistory.push({ stage: "school", approve: true, result: "通过", reason: schoolReason, reviewerId: admin.id, reviewerName: admin.name, at });
+          Object.assign(hazard, { review: schoolReason, reviewer: admin.name, reviewerId: admin.id, reviewedAt: at });
+          if (["已关闭", "整改中"].includes(state)) {
+            const districtApprove = state === "已关闭", districtReason = districtApprove ? "区级复查确认整改到位，同意关闭。" : "区级复查退回：请补充现场核对材料后重新提交。";
+            hazard.reviewHistory.push({ stage: "district", approve: districtApprove, result: districtApprove ? "通过" : "驳回", reason: districtReason, reviewerId: "DISTRICT", reviewerName: "周岚", at });
+            Object.assign(hazard, { review: districtReason, reviewer: "周岚", reviewerId: "DISTRICT", reviewedAt: at });
+          }
         }
         db.hazards.push(hazard); syncSafetyTask(db, check);
       });
@@ -551,6 +573,9 @@
     normalizeExperimentModel(db);
     normalizeSubjectFields(db);
     normalizeCabinets(db);
+    normalizeSafetyModel(db);
+    seedHazardSafetyExamples(db);
+    normalizeSafetyModel(db);
     Object.entries(tableNames).filter(([table]) => table !== "logs").forEach(([table, label]) => db[table].forEach(row => db.logs.push({ id: `INIT-${table}-${row.id}`, school: row.school || table === "schools" && row.id || "", table, recordId: row.id, action: "初始化数据", actor: "系统管理员", at: db.updatedAt, note: `${label}数据导入` })));
     return db;
   }
@@ -568,7 +593,7 @@
     return [...buckets.values()].map(b => ({ ...b, teacherNames: [...b.teacherSet].join("、"), gradeNames: [...b.gradeSet].join("、"), teacherSet: undefined, gradeSet: undefined, pending: b.required - b.done, rate: ratio(b.done, b.required), optionalPending: b.optional - b.optionalDone, optionalRate: ratio(b.optionalDone, b.optional), innovationPending: b.innovation - b.innovationDone, innovationRate: ratio(b.innovationDone, b.innovation), demonstrationRate: ratio(b.demonstrationDone, b.demonstration), groupRate: ratio(b.groupDone, b.group), total: b.required + b.optional + b.innovation, totalDone: b.done + b.optionalDone + b.innovationDone, totalRate: ratio(b.done + b.optionalDone + b.innovationDone, b.required + b.optional + b.innovation) }));
   }
   function metrics(db, school = "", term = "TERM26", subject = "") {
-    const assets = scoped(db, "assets", school).filter(asset => !asset.pendingReceiptId && itemFitsSubject(itemOf(db, asset), subject)), stock = scoped(db, "inventory", school).filter(row => !row.pendingReceiptId || !row.pendingReceiptCreated), tasks = scoped(db, "teachingTasks", school).filter(task => task.term === term && task.state !== "已失效" && (!subject || subjectEquals(taskContext(db, task).experiment.subject, subject))), expected = tasks.filter(task => taskContext(db, task).experiment.experimentCategory === "必做"), optional = tasks.filter(task => taskContext(db, task).experiment.experimentCategory === "选做"), innovation = tasks.filter(task => taskContext(db, task).experiment.experimentCategory === "创新实验"), hazards = scoped(db, "hazards", school), done = expected.filter(task => task.state === "已完成").length, optionalDone = optional.filter(task => task.state === "已完成").length, innovationDone = innovation.filter(task => task.state === "已完成").length;
+    const assets = scoped(db, "assets", school).filter(asset => !asset.pendingReceiptId && itemFitsSubject(itemOf(db, asset), subject)), stock = scoped(db, "inventory", school).filter(row => !row.pendingReceiptId || !row.pendingReceiptCreated), tasks = scoped(db, "teachingTasks", school).filter(task => task.term === term && task.state !== "已失效" && (!subject || subjectEquals(taskContext(db, task).experiment.subject, subject))), expected = tasks.filter(task => taskContext(db, task).experiment.experimentCategory === "必做"), optional = tasks.filter(task => taskContext(db, task).experiment.experimentCategory === "选做"), innovation = tasks.filter(task => taskContext(db, task).experiment.experimentCategory === "创新实验"), hazards = scoped(db, "hazards", school).filter(row => row.safetyScope === "hazardous"), done = expected.filter(task => task.state === "已完成").length, optionalDone = optional.filter(task => task.state === "已完成").length, innovationDone = innovation.filter(task => task.state === "已完成").length;
     return { assets: assets.length, normal: assets.filter(a => a.state === "正常使用").length, repair: assets.filter(a => a.state === "维修中").length, value: assets.filter(a => a.state !== "已报废").reduce((sum, a) => sum + a.price, 0), labs: scoped(db, "rooms", school).filter(r => r.type === "教学实验室" && (!subject || !r.subject || subjectEquals(r.subject, subject))).length, required: expected.length, done, pending: expected.length - done, rate: ratio(done, expected.length), optional: optional.length, optionalDone, optionalPending: optional.length - optionalDone, optionalRate: ratio(optionalDone, optional.length), innovation: innovation.length, innovationDone, innovationPending: innovation.length - innovationDone, innovationRate: ratio(innovationDone, innovation.length), totalTasks: tasks.length, totalDone: done + optionalDone + innovationDone, totalRate: ratio(done + optionalDone + innovationDone, tasks.length), low: stock.filter(r => r.stock < r.min && itemFitsSubject(itemOf(db, r), subject)).length, chemicals: stock.filter(r => isHazard(itemOf(db, r)) && (!subject || subjectEquals("化学", subject))).length, hazards: hazards.length, closed: hazards.filter(r => r.state === "已关闭").length, closure: ratio(hazards.filter(r => r.state === "已关闭").length, hazards.length), staff: scoped(db, "staff", school).filter(r => r.enabled).length, administrators: scoped(db, "staff", school).filter(r => r.enabled && r.role === "admin").length };
   }
   // Read-only overview projection. Counts and drill-down rows always share the same scope.
@@ -615,7 +640,7 @@
       if (reasons.length) resourceAlerts.push(row("inventory", r, r.name, reasons.join("；")));
     }
     // Safety is school-wide shared data, even while a teaching subject is selected.
-    const hazards = personal ? [] : db.hazards.filter(inSchool), openHazards = hazards.filter(r => r.state !== "已关闭");
+    const hazards = personal ? [] : db.hazards.filter(r => inSchool(r) && r.safetyScope === "hazardous"), openHazards = hazards.filter(r => r.state !== "已关闭");
     const hazardRows = openHazards.map(r => row("hazards", r, r.title, `${r.level} · ${label("staff", r.owner)}`, r.due, r.level === "需优先处理" ? 1 : 3));
     const chemicalAlerts = personal ? [] : db.inventory.filter(r => inSchool(r) && isHazard(r) && Number(r.stock) > 0 && (!r.pendingReceiptId || !r.pendingReceiptCreated)).flatMap(r => {
       const reasons = [], roomRecord = lookup("rooms", r.roomId), cabinet = lookup("cabinets", r.cabinetId);
@@ -623,14 +648,14 @@
       else if (r.expiry < today) reasons.push("已过期");
       else if (r.expiry <= dayAfter(today, 30)) reasons.push("30天内到期");
       if (!roomRecord || roomRecord.state !== "可用" || !roomRecord.hazardStorage) reasons.push("房间存放条件待核对");
-      if (r.cabinetId && (!cabinet || cabinet.state !== "启用" || !cabinet.hazardDedicated || cabinet.roomId !== r.roomId)) reasons.push("柜位条件待核对");
+      if (r.cabinetId && (!cabinet || cabinet.state !== "启用" || !cabinet.hazardStorage || cabinet.roomId !== r.roomId)) reasons.push("柜位条件待核对");
       return reasons.length ? [row("inventory", r, r.name, reasons.join("、"), r.expiry || "", r.expiry && r.expiry < today ? 0 : 2)] : [];
     });
-    const checks = personal ? [] : db.tasks.filter(inSchool), checkRows = checks.filter(r => r.state === "待检查").map(r => row("tasks", r, r.kind, `${label("rooms", r.roomId)} · ${label("staff", r.owner)}`, r.due));
+    const checks = personal ? [] : db.tasks.filter(r => inSchool(r) && r.safetyScope === "hazardous"), checkRows = checks.filter(r => r.state === "待检查").map(r => row("tasks", r, r.kind, `${safetyTargetLabel(db, r)} · ${r.owner || "未登记"}`, r.due));
     const safetyRows = [...hazardRows, ...chemicalAlerts, ...checkRows];
-    const purchaseRows = personal ? [] : db.purchases.filter(r => inSchool(r) && (!subject || (r.items || []).some(item => itemFitsSubject(item, subject)))).filter(r => district ? r.state === "待审核" : ["已通过", "已驳回"].includes(r.state)).map(r => row("purchases", r, district ? "采购待审核" : r.state === "已通过" ? "采购已通过，待到货入库" : "采购已驳回", r.purpose || r.id));
+    const purchaseRows = personal ? [] : db.purchases.filter(r => inSchool(r) && (!subject || (r.items || []).some(item => itemFitsSubject(item, subject)))).filter(r => district ? r.state === "待审核" : r.state === "已驳回" || r.state === "已通过" && !r.receiptId).map(r => row("purchases", r, district ? "采购待审核" : r.state === "已通过" ? "采购已通过，待到货入库" : "采购已驳回", r.purpose || r.id));
     const reviewRows = personal || district ? [] : db.flows.filter(r => inSchool(r) && r.state === "待复核" && r.applicantId !== actor.id && itemFitsSubject(r.snapshot || lookup("inventory", r.itemId), subject)).map(r => row("flows", r, "库存待第二人复核", `${label("inventory", r.itemId)} · ${r.kind}`));
-    const todo = district ? [...purchaseRows, ...hazardRows.filter(r => r.state === "待复查")] : personal ? [...pendingBookings.filter(r => r.state === "已退回"), ...pendingSummary.map(r => ({ ...r, title: "实验待登记总结", description: `${r.className} · ${r.title}` }))] : [...pendingBookings.filter(r => r.state === "待安排"), ...pendingSummary.map(r => ({ ...r, title: "实验待登记总结", description: `${r.className} · ${r.title}` })), ...checkRows, ...hazardRows.filter(r => r.state !== "待复查"), ...reviewRows, ...purchaseRows];
+    const todo = district ? [...purchaseRows, ...hazardRows.filter(r => r.state === "待区级复查")] : personal ? [...pendingBookings.filter(r => r.state === "已退回"), ...pendingSummary.map(r => ({ ...r, title: "实验待登记总结", description: `${r.className} · ${r.title}` }))] : [...pendingBookings.filter(r => r.state === "待安排"), ...pendingSummary.map(r => ({ ...r, title: "实验待登记总结", description: `${r.className} · ${r.title}` })), ...checkRows, ...hazardRows.filter(r => ["待整改", "整改中", "待校内复核"].includes(r.state)), ...reviewRows, ...purchaseRows];
     const urgency = r => r.priority === 0 || r.due && r.due < today ? 0 : r.priority === 1 || r.due === today ? 1 : r.due && r.due <= dayAfter(today, 3) ? 2 : r.priority;
     const sort = rows => rows.map(r => ({ ...r, urgency: urgency(r), timing: r.due ? r.due < today ? "已过期/超期" : r.due === today ? "今日" : r.due <= dayAfter(today, 3) ? "三天内" : r.due : "待处理" })).sort((a, b) => a.urgency - b.urgency || (a.due || "9999").localeCompare(b.due || "9999") || a.id.localeCompare(b.id));
     const configRows = [], submissionRows = [];
@@ -663,7 +688,7 @@
       teaching: teaching(db, schoolId, termId, options.by || "subject", { subject, ...(personal ? { teacherId: actor.id } : {}) }),
       lists: { required, late, week: weekRows, pendingBookings, pendingSummary, todo: sort(todo), resources: sort(resourceAlerts), safety: sort(safetyRows), hazards: sort(hazardRows), chemicals: sort(chemicalAlerts), checks: sort(checkRows), config: configRows, assets: assets.map(r => row("assets", r, r.name, r.state)), rooms: rooms.filter(r => r.type === "教学实验室").map(r => row("rooms", r, r.name, r.state)) },
       resources: { assets: assets.length, normal: assets.filter(r => r.state === "正常使用").length, scrapped: assets.filter(r => r.state === "已报废").length, value: assets.filter(r => r.state !== "已报废").reduce((n, r) => n + Number(r.price || 0), 0), labs: rooms.filter(r => r.type === "教学实验室").length, availableLabs: rooms.filter(r => r.type === "教学实验室" && r.state === "可用").length, cabinets: personal ? 0 : db.cabinets.filter(r => inSchool(r) && rooms.some(room => room.id === r.roomId) && r.state === "启用").length, low: stocks.filter(r => r.stock < r.min).length },
-      safety: { open: hazardRows.length, overdue: hazardRows.filter(r => r.due && r.due < today).length, closed: hazards.length - hazardRows.length, closure: ratio(hazards.length - hazardRows.length, hazards.length), checks: checkRows.length, monthChecks: personal ? 0 : db.checks.filter(r => inSchool(r) && r.date >= `${today.slice(0, 7)}-01` && r.date <= today).length }, submissions: submissionRows };
+      safety: { open: hazardRows.length, overdue: hazardRows.filter(r => r.due && r.due < today).length, closed: hazards.length - hazardRows.length, closure: ratio(hazards.length - hazardRows.length, hazards.length), checks: checkRows.length, monthChecks: personal ? 0 : db.checks.filter(r => inSchool(r) && r.safetyScope === "hazardous" && r.date >= `${today.slice(0, 7)}-01` && r.date <= today).length }, submissions: submissionRows };
   }
   function auditRelations(db) {
     const issues = [], exists = (table, id) => !!id && !!db[table]?.some(row => row.id === id), has = (table, id) => !id || exists(table, id), rowOf = (table, id) => db[table]?.find(row => row.id === id), need = (ok, message) => { if (!ok) issues.push(message); };
@@ -777,9 +802,65 @@
       need(!!arrangement, `总结${row.id}安排不存在`); if (arrangement) need(row.school === arrangement.school && subject === normalizeSubject(arrangement.subject), `总结${row.id}与安排学校或学科不一致`);
       need(arrangement?.state === "已完成" && booking?.state === "已完成" && task?.state === "已完成", `总结${row.id}未同步完成安排、预约和任务`);
     });
-    (db.tasks || []).forEach(row => { const room = rowOf("rooms", row.roomId), check = rowOf("checks", row.checkId); need(!!row.roomId && exists("rooms", row.roomId), `检查任务${row.id}房间不存在`); need(has("checks", row.checkId), `检查任务${row.id}检查记录不存在`); if (room) sameSchool(row, room, `检查任务${row.id}与房间学校不一致`); if (check) { sameSchool(row, check, `检查任务${row.id}与检查记录学校不一致`); need(!check.taskId || check.taskId === row.id, `检查任务${row.id}与检查记录反向关系不一致`); } });
-    (db.checks || []).forEach(row => { const room = rowOf("rooms", row.roomId), task = rowOf("tasks", row.taskId); need(!!row.roomId && exists("rooms", row.roomId), `检查记录${row.id}房间不存在`); need(has("tasks", row.taskId), `检查记录${row.id}检查任务不存在`); if (room) sameSchool(row, room, `检查记录${row.id}与房间学校不一致`); if (task) { sameSchool(row, task, `检查记录${row.id}与检查任务学校不一致`); need(!task.checkId || task.checkId === row.id, `检查记录${row.id}与检查任务反向关系不一致`); } });
-    (db.hazards || []).forEach(row => { const check = rowOf("checks", row.checkId), room = rowOf("rooms", row.roomId), archive = rowOf("archives", row.attachmentId); need(!!row.checkId && exists("checks", row.checkId), `隐患${row.id}检查记录不存在`); need(!!row.roomId && exists("rooms", row.roomId), `隐患${row.id}房间不存在`); need(has("archives", row.attachmentId), `隐患${row.id}整改附件不存在`); if (check) { sameSchool(row, check, `隐患${row.id}与检查记录学校不一致`); need(!check.roomId || check.roomId === row.roomId, `隐患${row.id}与检查房间不一致`); } if (room) sameSchool(row, room, `隐患${row.id}与房间学校不一致`); if (archive) { sameSchool(row, archive, `隐患${row.id}与附件学校不一致`); need(archive.relatedTable === "hazards" && archive.relatedId === row.id, `隐患${row.id}与整改附件反向关系不一致`); } });
+    const safetyTarget = (row, label) => {
+      const targetTable = { inventory: "inventory", cabinet: "cabinets", room: "rooms" }[row.targetType], target = targetTable && rowOf(targetTable, row.targetId), roomId = row.targetType === "room" ? row.targetId : target?.roomId, room = rowOf("rooms", row.roomId);
+      need(["hazardous", "general"].includes(row.safetyScope), `${label}安全范围无效`);
+      need(!!targetTable && !!target, `${label}检查对象不存在`);
+      need(!!row.roomId && !!room, `${label}房间不存在`);
+      if (target) { sameSchool(row, target, `${label}与检查对象学校不一致`); need(roomId === row.roomId, `${label}检查对象与房间不一致`); }
+      if (room) sameSchool(row, room, `${label}与房间学校不一致`);
+      if (row.safetyScope === "general") need(row.targetType === "room", `${label}一般安全检查须以房间为对象`);
+      if (row.safetyScope === "hazardous" && room) {
+        need(room.hazardStorage === true, `${label}危化品检查房间不具备存放条件`);
+        if (row.targetType === "inventory" && target) need(isHazard(itemOf(db, target)) && !target.pendingReceiptCreated, `${label}库存对象不是正式危化品库存`);
+        if (row.targetType === "cabinet" && target) need(target.hazardStorage === true, `${label}橱柜对象不是危化品专柜`);
+      }
+    };
+    (db.tasks || []).forEach(row => {
+      const check = rowOf("checks", row.checkId); safetyTarget(row, `检查任务${row.id}`);
+      need(has("checks", row.checkId), `检查任务${row.id}检查记录不存在`);
+      need(["待检查", "待整改", "已完成"].includes(row.state), `检查任务${row.id}状态无效：${row.state}`);
+      if (check) {
+        sameSchool(row, check, `检查任务${row.id}与检查记录学校不一致`);
+        need(!check.taskId || check.taskId === row.id, `检查任务${row.id}与检查记录反向关系不一致`);
+        need(sameSafetyTarget(row, check), `检查任务${row.id}与检查记录对象不一致`);
+        const hazards = (db.hazards || []).filter(hazard => hazard.checkId === check.id), expected = hazards.length ? hazards.every(hazard => hazard.state === "已关闭") ? "已完成" : "待整改" : check.result === "正常" ? "已完成" : "待检查";
+        need(row.state === expected, `检查任务${row.id}未同步检查与隐患状态`);
+      }
+    });
+    (db.checks || []).forEach(row => {
+      const task = rowOf("tasks", row.taskId); safetyTarget(row, `检查记录${row.id}`);
+      need(has("tasks", row.taskId), `检查记录${row.id}检查任务不存在`);
+      if (task) { sameSchool(row, task, `检查记录${row.id}与检查任务学校不一致`); need(!task.checkId || task.checkId === row.id, `检查记录${row.id}与检查任务反向关系不一致`); need(sameSafetyTarget(row, task), `检查记录${row.id}与检查任务对象不一致`); }
+    });
+    (db.hazards || []).forEach(row => {
+      const check = rowOf("checks", row.checkId), archive = rowOf("archives", row.attachmentId), submissions = Array.isArray(row.submissionHistory) ? row.submissionHistory : [], reviews = Array.isArray(row.reviewHistory) ? row.reviewHistory : [];
+      safetyTarget(row, `隐患${row.id}`);
+      need(!!row.checkId && exists("checks", row.checkId), `隐患${row.id}检查记录不存在`);
+      need(["待整改", "整改中", "待校内复核", "待区级复查", "已关闭"].includes(row.state), `隐患${row.id}状态无效：${row.state}`);
+      need(Array.isArray(row.submissionHistory), `隐患${row.id}整改提交历史格式无效`);
+      need(Array.isArray(row.reviewHistory), `隐患${row.id}审核历史格式无效`);
+      need(has("archives", row.attachmentId), `隐患${row.id}整改附件不存在`);
+      if (check) { sameSchool(row, check, `隐患${row.id}与检查记录学校不一致`); need(sameSafetyTarget(row, check), `隐患${row.id}与检查对象不一致`); }
+      if (archive) { sameSchool(row, archive, `隐患${row.id}与附件学校不一致`); need(archive.relatedTable === "hazards" && archive.relatedId === row.id, `隐患${row.id}与整改附件反向关系不一致`); }
+      submissions.forEach((submission, index) => {
+        const file = rowOf("archives", submission.attachmentId);
+        need(!!submission.rectification && (!!submission.at || submission.legacy === true), `隐患${row.id}第${index + 1}次整改提交信息不完整`);
+        need(!!file, `隐患${row.id}第${index + 1}次整改附件不存在`);
+        if (file) need(file.school === row.school && file.relatedTable === "hazards" && file.relatedId === row.id, `隐患${row.id}第${index + 1}次整改附件关系不一致`);
+      });
+      let schoolApproved = false;
+      reviews.forEach((review, index) => {
+        need(["school", "district"].includes(review.stage), `隐患${row.id}第${index + 1}次审核阶段无效`);
+        need(["通过", "驳回"].includes(review.result) && review.approve === (review.result === "通过"), `隐患${row.id}第${index + 1}次审核结果无效`);
+        need(!!review.reason && !!review.reviewerName && !!review.at, `隐患${row.id}第${index + 1}次审核信息不完整`);
+        if (review.stage === "school") schoolApproved = review.approve === true;
+        if (review.stage === "district") { need(schoolApproved, `隐患${row.id}区级复查前缺少校内通过记录`); schoolApproved = false; }
+      });
+      if (["待校内复核", "待区级复查"].includes(row.state) || row.state === "已关闭" && !row.legacyClosed) need(!!row.rectification && !!row.attachmentId && submissions.length > 0, `隐患${row.id}当前状态缺少整改提交材料`);
+      if (row.state === "待区级复查") need(reviews.at(-1)?.stage === "school" && reviews.at(-1)?.approve === true, `隐患${row.id}待区级复查但缺少最近一次校内通过记录`);
+      if (row.state === "已关闭" && !row.legacyClosed) need(reviews.at(-1)?.stage === "district" && reviews.at(-1)?.approve === true, `隐患${row.id}已关闭但缺少区级通过记录`);
+    });
     (db.archives || []).forEach(row => { const linked = db[row.relatedTable]?.find(record => record.id === row.relatedId); need(!!row.relatedTable && !!row.relatedId && !!linked, `附件${row.id}关联记录不存在：${row.relatedTable}.${row.relatedId}`); if (linked) sameSchool(row, linked, `附件${row.id}与关联记录学校不一致`); });
     (db.resources || []).forEach(row => {
       const uploader = rowOf("staff", row.uploaderId); checkSubject(row, `教学资源${row.id}`); need(has("schools", row.school), `教学资源${row.id}学校不存在`); need(has("staff", row.uploaderId), `教学资源${row.id}上传人不存在`); if (uploader) sameSchool(row, uploader, `教学资源${row.id}与上传人学校不一致`); need(resourceTypes.includes(row.resourceType), `教学资源${row.id}类型无效`);
@@ -1271,19 +1352,81 @@
       find(db, "teachingTasks", booking.taskId).state = "已取消";
       log("bookings", booking, arrangement ? "取消实验安排" : "取消预约", cancelReason);
     }
-    else if (command === "task.create") { permit(["district"]); const row = p.id ? get("tasks") : { id: id("JCJH"), state: "待检查" }; if (p.id) state(row, ["待检查"]); const room = find(db, "rooms", p.roomId); row.school = room.school; row.roomId = room.id; row.kind = text(p.kind, "检查类型"); row.due = date(p.due); row.owner = text(p.owner, "责任人"); p.id ? log("tasks", row, "修改检查任务") : add("tasks", row, "下发检查任务"); }
+    else if (command === "task.create") {
+      permit(["district"]);
+      const row = p.id ? get("tasks") : { id: id("JCJH"), state: "待检查" };
+      if (p.id) state(row, ["待检查"]);
+      const context = safetyContext(db, { ...row, ...p });
+      Object.assign(row, context, { sourceType: "district", createdBy: row.createdBy || actor.id, kind: text(p.kind, "检查类型"), due: date(p.due), owner: text(p.owner, "责任人") });
+      p.id ? log("tasks", row, "修改检查任务") : add("tasks", row, "下发检查任务");
+    }
     else if (command === "inspection-task.delete") { permit(["district"]); const row = get("tasks"); state(row, ["待检查"]); must(!row.checkId && !db.checks.some(check => check.taskId === row.id) && !hasArchive("tasks", row.id), "检查任务已有检查记录或附件，不能删除。"); remove("tasks", row, "删除检查任务", text(p.reason, "删除原因", 100)); }
-    else if (command === "check.create") { permit(["admin"]); const task = p.taskId ? get("tasks", p.taskId) : null; if (task) state(task, ["待检查"]); const room = get("rooms", task?.roomId || p.roomId), outcome = choice(p.result, ["正常", "发现隐患"], "检查结果"), row = { id: id("JC"), school: room.school, roomId: room.id, taskId: task?.id || "", kind: task?.kind || text(p.kind, "类型"), date: date(p.date), inspector: actor.name, items: text(p.items, "检查项目"), result: outcome, note: optional(p.note, "检查说明", 500) }; add("checks", row, "提交检查记录"); if (task) { task.state = outcome === "正常" ? "已完成" : "待整改"; task.checkId = row.id; log("tasks", task, task.state, row.id); } if (outcome === "发现隐患") { const due = date(p.due); must(due >= row.date, "整改期限不能早于检查日期。"); const titles = String(p.title || "").split(/[\n；;]+/).map(title => title.trim()).filter(Boolean); must(titles.length > 0, "请填写至少一项隐患描述。"); titles.forEach(title => add("hazards", { id: id("YH"), school: room.school, checkId: row.id, roomId: room.id, title: text(title, "隐患描述"), owner: text(p.owner, "责任人"), level: choice(p.level, ["一般关注", "需优先处理"], "优先级"), due, date: row.date, state: "待整改", note: row.note }, "检查发现隐患")); } result = row; }
-    else if (command === "check.update") { permit(["admin"]); const row = get("checks"); must(!db.hazards.some(hazard => hazard.checkId === row.id), "检查记录已形成隐患，请在隐患记录中修改整改信息。"); const task = row.taskId ? find(db, "tasks", row.taskId) : null, room = get("rooms", task?.roomId || p.roomId), outcome = choice(p.result, ["正常", "发现隐患"], "检查结果"); row.roomId = room.id; row.kind = task?.kind || text(p.kind, "类型"); row.date = date(p.date); row.items = text(p.items, "检查项目"); row.result = outcome; row.note = optional(p.note, "检查说明", 500); log("checks", row, "修改检查记录"); if (task) { task.state = outcome === "正常" ? "已完成" : "待整改"; task.checkId = row.id; log("tasks", task, task.state, row.id); } if (outcome === "发现隐患") { const due = date(p.due); must(due >= row.date, "整改期限不能早于检查日期。"); const titles = String(p.title || "").split(/[\n；;]+/).map(title => title.trim()).filter(Boolean); must(titles.length > 0, "请填写至少一项隐患描述。"); titles.forEach(title => add("hazards", { id: id("YH"), school: row.school, checkId: row.id, roomId: row.roomId, title: text(title, "隐患描述"), owner: text(p.owner, "责任人"), level: choice(p.level, ["一般关注", "需优先处理"], "优先级"), due, date: row.date, state: "待整改", note: row.note }, "检查修改后形成隐患")); } result = row; }
+    else if (command === "check.create") {
+      permit(["admin"]);
+      const task = p.taskId ? get("tasks", p.taskId) : null;
+      if (task) state(task, ["待检查"]);
+      const context = task ? safetyContext(db, task, actor.school) : safetyContext(db, p, actor.school), outcome = choice(p.result, ["正常", "发现隐患"], "检查结果"), row = { id: id("JC"), ...context, taskId: task?.id || "", kind: task?.kind || text(p.kind, "类型"), date: date(p.date), inspector: actor.name, inspectorId: actor.id, items: text(p.items, "检查项目"), result: outcome, note: optional(p.note, "检查说明", 500) };
+      add("checks", row, "提交检查记录");
+      if (task) { task.checkId = row.id; log("tasks", task, outcome === "正常" ? "检查完成" : "检查发现隐患", row.id); }
+      if (outcome === "发现隐患") {
+        const due = date(p.due); must(due >= row.date, "整改期限不能早于检查日期。");
+        const titles = String(p.title || "").split(/[\n；;]+/).map(title => title.trim()).filter(Boolean); must(titles.length > 0, "请填写至少一项隐患描述。");
+        titles.forEach(title => add("hazards", { id: id("YH"), ...context, checkId: row.id, title: text(title, "隐患描述"), owner: text(p.owner, "责任人"), level: choice(p.level, ["一般关注", "需优先处理"], "优先级"), due, date: row.date, state: "待整改", note: row.note, reviewHistory: [], submissionHistory: [] }, "检查发现隐患"));
+      }
+      syncSafetyTask(db, row); result = row;
+    }
+    else if (command === "check.update") {
+      permit(["admin"]);
+      const row = get("checks"); must(!db.hazards.some(hazard => hazard.checkId === row.id), "检查记录已形成隐患，请在隐患记录中修改整改信息。");
+      const task = row.taskId ? find(db, "tasks", row.taskId) : null, context = task ? safetyContext(db, task, actor.school) : safetyContext(db, { ...row, ...p }, actor.school), outcome = choice(p.result, ["正常", "发现隐患"], "检查结果");
+      Object.assign(row, context, { kind: task?.kind || text(p.kind, "类型"), date: date(p.date), items: text(p.items, "检查项目"), result: outcome, note: optional(p.note, "检查说明", 500) });
+      log("checks", row, "修改检查记录");
+      if (task) { task.checkId = row.id; log("tasks", task, outcome === "正常" ? "检查完成" : "检查发现隐患", row.id); }
+      if (outcome === "发现隐患") {
+        const due = date(p.due); must(due >= row.date, "整改期限不能早于检查日期。");
+        const titles = String(p.title || "").split(/[\n；;]+/).map(title => title.trim()).filter(Boolean); must(titles.length > 0, "请填写至少一项隐患描述。");
+        titles.forEach(title => add("hazards", { id: id("YH"), ...context, checkId: row.id, title: text(title, "隐患描述"), owner: text(p.owner, "责任人"), level: choice(p.level, ["一般关注", "需优先处理"], "优先级"), due, date: row.date, state: "待整改", note: row.note, reviewHistory: [], submissionHistory: [] }, "检查修改后形成隐患"));
+      }
+      syncSafetyTask(db, row); result = row;
+    }
     else if (command === "check.delete") { permit(["admin"]); const row = get("checks"); must(!db.hazards.some(hazard => hazard.checkId === row.id) && !hasArchive("checks", row.id), "检查记录已有隐患或附件，不能删除。"); if (row.taskId) { const task = find(db, "tasks", row.taskId); task.state = "待检查"; delete task.checkId; log("tasks", task, "删除检查记录后恢复待检查", row.id); } remove("checks", row, "删除检查记录", text(p.reason, "删除原因", 100)); }
     else if (command === "hazard.update") { permit(["admin"]); const row = get("hazards"); state(row, ["待整改", "整改中"]); row.title = text(p.title, "隐患描述"); row.owner = text(p.owner, "责任人"); row.level = choice(p.level, ["一般关注", "需优先处理"], "优先级"); row.due = date(p.due); must(row.due >= row.date, "整改期限不能早于检查日期。"); row.note = optional(p.note, "说明", 500); log("hazards", row, "修改隐患信息"); }
     else if (command === "hazard.delete") { permit(["admin"]); const row = get("hazards"); state(row, ["待整改"]); must(!row.attachmentId && !hasArchive("hazards", row.id), "隐患已有整改附件，不能删除。"); const check = find(db, "checks", row.checkId); remove("hazards", row, "删除隐患记录", text(p.reason, "删除原因", 100)); if (!db.hazards.some(hazard => hazard.checkId === check.id)) { check.result = "正常"; log("checks", check, "删除隐患后更正检查结果为正常", row.id); if (check.taskId) { const task = find(db, "tasks", check.taskId); task.state = "已完成"; log("tasks", task, "删除隐患后完成检查", row.id); } } result = row; }
-    else if (command === "hazard.submit") { permit(["admin"]); const row = get("hazards"); state(row, ["待整改", "整改中"]); row.rectification = text(p.reason, "整改说明"); const file = get("archives", p.attachmentId); must(file.relatedTable === "hazards" && file.relatedId === row.id, "请选择关联当前隐患的整改附件。"); row.attachmentId = file.id; row.state = "待复查"; log("hazards", row, "提交整改复查", row.rectification); }
-    else if (command === "hazard.verify") { permit(["district"]); const row = get("hazards"); state(row, ["待复查"]); row.review = text(p.reason, "复查意见"); row.reviewer = actor.name; row.state = p.approve === true ? "已关闭" : "整改中"; if (row.state === "已关闭") { const check = find(db, "checks", row.checkId); if (check.taskId && !db.hazards.some(h => h.checkId === check.id && h.id !== row.id && h.state !== "已关闭")) { const task = find(db, "tasks", check.taskId); task.state = "已完成"; log("tasks", task, "整改复查完成"); } } log("hazards", row, row.state, row.review); }
+    else if (command === "hazard.submit") {
+      permit(["admin"]);
+      const row = get("hazards"); state(row, ["待整改", "整改中"]);
+      const rectification = text(p.reason, "整改说明"), file = get("archives", p.attachmentId);
+      must(file.relatedTable === "hazards" && file.relatedId === row.id, "请选择关联当前隐患的整改附件。");
+      Object.assign(row, { rectification, attachmentId: file.id, submitterId: actor.id, submitterName: actor.name, submittedAt: now, state: "待校内复核" });
+      row.submissionHistory ||= [];
+      row.submissionHistory.push({ submitterId: actor.id, submitterName: actor.name, at: now, rectification, attachmentId: file.id });
+      syncSafetyTask(db, find(db, "checks", row.checkId));
+      log("hazards", row, "提交校内复核", rectification);
+    }
+    else if (command === "hazard.schoolReview") {
+      permit(["admin"]);
+      const row = get("hazards"); state(row, ["待校内复核"]);
+      const approve = p.approve === true, review = text(p.reason, "校内复核意见");
+      row.reviewHistory ||= [];
+      row.reviewHistory.push({ stage: "school", approve, result: approve ? "通过" : "驳回", reason: review, reviewerId: actor.id, reviewerName: actor.name, at: now });
+      Object.assign(row, { reviewStage: "school", review, reviewer: actor.name, reviewerId: actor.id, reviewedAt: now, state: approve ? "待区级复查" : "整改中" });
+      syncSafetyTask(db, find(db, "checks", row.checkId));
+      log("hazards", row, approve ? "校内复核通过" : "校内复核驳回", review);
+    }
+    else if (command === "hazard.verify") {
+      permit(["district"]);
+      const row = get("hazards"); state(row, ["待区级复查"]);
+      const approve = p.approve === true, review = text(p.reason, "区级复查意见");
+      row.reviewHistory ||= [];
+      row.reviewHistory.push({ stage: "district", approve, result: approve ? "通过" : "驳回", reason: review, reviewerId: actor.id, reviewerName: actor.name, at: now });
+      Object.assign(row, { reviewStage: "district", review, reviewer: actor.name, reviewerId: actor.id, reviewedAt: now, state: approve ? "已关闭" : "整改中" });
+      syncSafetyTask(db, find(db, "checks", row.checkId));
+      log("hazards", row, approve ? "区级复查通过并关闭" : "区级复查驳回", review);
+    }
     else if (command === "archive.create") { permit(["admin", "teacher"]); const table = choice(p.relatedTable, ["assets", "purchases", "repairs", "plans", "bookings", "arrangements", "summaries", "checks", "hazards", "staff", "receipts"], "关联业务"), linked = get(table, p.relatedId); if (actor.role === "teacher") { const canSeePlan = table === "plans" && (linked.createdBy === actor.id || db.teachingTasks.some(task => task.teacherId === actor.id && find(db, "planItems", task.planItemId).planId === linked.id)), allowed = table === "staff" && linked.id === actor.id || linked.teacherId === actor.id || linked.reporter === actor.name || canSeePlan || table === "arrangements" && find(db, "bookings", linked.bookingId).teacherId === actor.id || table === "summaries" && find(db, "bookings", find(db, "arrangements", linked.arrangementId).bookingId).teacherId === actor.id; must(allowed, "教师只能上传本人业务资料。"); } const name = text(p.name, "文件名"); must(!/\.(html?|svg|js|exe|sh)$/i.test(name), "不接受可执行文件、HTML或SVG附件。"); const content = String(p.content || ""), dataUrl = String(p.dataUrl || ""); must(content || /^data:[\w.+/-]+;base64,[A-Za-z0-9+/=]+$/.test(dataUrl), "请上传文件或填写文本内容。"); must(content.length + dataUrl.length <= 750000, "单个附件限512KB左右。"); add("archives", { id: id("FILE"), school: actor.school, name, category: choice(p.category, ["实验教学", "安全管理", "人员档案", "设备建设"], "资料分类"), relatedTable: table, relatedId: linked.id, attachmentType: p.attachmentType || "OTHER", date: TODAY, uploader: actor.name, state: p.archive === true ? "已归档" : "待归档", mime: String(p.mime || "text/plain;charset=utf-8"), content, dataUrl }, "上传业务资料"); }
     else if (command === "archive.confirm") { permit(["admin"]); const row = get("archives"); state(row, ["待归档"]); row.state = "已归档"; log("archives", row, "确认归档"); }
     else if (command === "archive.update") { permit(["admin"]); const row = get("archives"); state(row, ["待归档"]); row.name = text(p.name, "文件名"); must(!/\.(html?|svg|js|exe|sh)$/i.test(row.name), "不接受可执行文件、HTML或SVG附件。"); row.category = choice(p.category, ["实验教学", "安全管理", "人员档案", "设备建设"], "资料分类"); if (!row.dataUrl) { row.content = text(p.content, "文本附件内容", 750000); row.mime = "text/plain;charset=utf-8"; } log("archives", row, "修改待归档资料"); }
-    else if (command === "archive.delete") { permit(["admin"]); const row = get("archives"); state(row, ["待归档"]); must(!db.hazards.some(hazard => hazard.attachmentId === row.id), "附件已用于隐患整改，不能删除。"); remove("archives", row, "删除待归档资料", text(p.reason, "删除原因", 100)); }
+    else if (command === "archive.delete") { permit(["admin"]); const row = get("archives"); state(row, ["待归档"]); must(!db.hazards.some(hazard => hazard.attachmentId === row.id || (hazard.submissionHistory || []).some(item => item.attachmentId === row.id)), "附件已用于隐患整改，不能删除。"); remove("archives", row, "删除待归档资料", text(p.reason, "删除原因", 100)); }
     else if (command === "teacher.assignments.save") {
       permit(["admin"]);
       const teacher = get("staff", p.teacherId), term = find(db, "terms", p.term);
@@ -1337,6 +1480,7 @@
     else if (command === "submission.create") { permit(["admin"]); find(db, "terms", p.term); add("submissions", { id: id("SB"), school: actor.school, term: p.term, date: TODAY, at: now, operator: actor.name, revision: original.revision, summary: metrics(db, actor.school, p.term), state: "已上报" }, "上报当前台账快照"); }
     else throw new Error("不支持的业务操作。");
     normalizeSubjectFields(db);
+    normalizeSafetyModel(db);
     db.revision++; db.updatedAt = now; return { db, result };
   }
 
@@ -1511,6 +1655,7 @@
       normalizeExperimentModel(current);
       normalizeSubjectFields(current);
       normalizeCabinets(current);
+      normalizeSafetyModel(current);
       return current;
     }
     if (raw.version !== 2) throw new Error("仅支持从v2至v12升级到当前版本");
@@ -1545,10 +1690,11 @@
     normalizeReferenceWorkflows(db);
     normalizeSubjectFields(db);
     normalizeCabinets(db);
+    normalizeSafetyModel(db);
     db.logs.push({ id: `MIGRATION-V12-${++db.seq}`, school: "", table: "settings", recordId: "DATA", action: "数据结构升级", actor: "系统", at: new Date().toISOString(), note: "v2-v12升级：新增房间下橱柜与位置调整" }); return db;
   }
 
-  const api = { KEY, VERSION, TODAY, roles, navigation, navigationFor, tableNames, categories, subjects, subjectDefinitions, subjectOptions, subjectCodes, normalizeSubject, subjectLabel, subjectCode, subjectEquals, subjectOptionsFor, normalizeSubjectFields, resourceTypes, resourceGrades, resourceCategories, experimentCategories, experimentSources, implementationModes, seed, clone, find, scoped, metrics, auditRelations, teaching, taskContext, experimentOf, equipmentRows, normalizeExperimentModel, itemOf, itemById, itemRecord, isHazard, itemFitsSubject, itemSubjectScopes, roomFitsItem, roomLabel, cabinetOf, cabinetFitsItem, locationLabel, normalizeCabinets, periodFor, syncTeachingTasks, actorFor, transact, ratio, weekOf, weekDate, parseCSV, validateImport, importHeader, csv, activeBooking, activeArrangement, migrate };
+  const api = { KEY, VERSION, TODAY, roles, navigation, navigationFor, tableNames, categories, subjects, subjectDefinitions, subjectOptions, subjectCodes, normalizeSubject, subjectLabel, subjectCode, subjectEquals, subjectOptionsFor, normalizeSubjectFields, resourceTypes, resourceGrades, resourceCategories, experimentCategories, experimentSources, implementationModes, seed, clone, find, scoped, metrics, overview, auditRelations, teaching, taskContext, experimentOf, equipmentRows, normalizeExperimentModel, itemOf, itemById, itemRecord, isHazard, itemFitsSubject, itemSubjectScopes, roomFitsItem, roomLabel, cabinetOf, cabinetFitsItem, locationLabel, normalizeCabinets, safetyContext, safetyTargetLabel, safetyRelatedToStock, syncSafetyTask, normalizeSafetyModel, periodFor, syncTeachingTasks, actorFor, transact, ratio, weekOf, weekDate, parseCSV, validateImport, importHeader, csv, activeBooking, activeArrangement, migrate };
   if (typeof module !== "undefined") module.exports = api;
   if (root) { root.LabDemo = api; root.DEMO_DATA = { navigation }; }
 })(typeof window === "undefined" ? null : window);

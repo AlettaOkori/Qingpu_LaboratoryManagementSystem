@@ -66,7 +66,8 @@ python3 -m http.server 8765 --bind 127.0.0.1 --directory new-demo
 
 访问 [http://127.0.0.1:8765/](http://127.0.0.1:8765/)。请持续使用同一地址和端口；不同来源的浏览器存储不共享，不建议直接双击 `file://` 页面。
 
-- `index.html`、`login.html`：免密码身份选择入口。
+- `index.html`：默认进入学校管理端首页。
+- `login.html`：免密码身份选择入口。
 - `pages/district/`：区级管理页面。
 - `pages/school/`：学校管理员和任课教师按权限共用的学校页面。
 - `preview.html`：内部页面总览，只从“系统控制”进入。

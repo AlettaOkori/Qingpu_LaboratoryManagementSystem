@@ -15,18 +15,18 @@ function test(name, fn) {
 function fixture(initial = M.seed()) {
   let db = M.clone(initial);
   let tick = 0;
-  const actor = (role, school = "S1") => M.actorFor(db, role, school);
+  const actor = (role, school = "S1", personId = "") => M.actorFor(db, role, school, personId);
   const now = () => `2026-08-31T${String(9 + Math.floor(tick / 60)).padStart(2, "0")}:${String(tick++ % 60).padStart(2, "0")}:00+08:00`;
   return {
     get db() { return db; },
-    run(role, command, input, school = "S1") {
-      const out = M.transact(db, actor(role, school), command, input, now());
+    run(role, command, input, school = "S1", personId = "") {
+      const out = M.transact(db, actor(role, school, personId), command, input, now());
       db = out.db;
       return out.result;
     },
-    reject(role, command, input, regex, school = "S1") {
+    reject(role, command, input, regex, school = "S1", personId = "") {
       const before = JSON.stringify(db);
-      assert.throws(() => M.transact(db, actor(role, school), command, input, now()), regex);
+      assert.throws(() => M.transact(db, actor(role, school, personId), command, input, now()), regex);
       assert.equal(JSON.stringify(db), before, "被拒绝的操作不得修改原数据");
     }
   };
@@ -96,11 +96,25 @@ test("危化品安全样例、对象辅助函数和关系审计可用", () => {
   assert.deepEqual(M.auditRelations(db), [], "初始安全样例的对象、附件和状态关系应完整");
 });
 
+test("整改说明与佐证材料在同一事务内提交", () => {
+  const f = fixture(), hazard = f.db.hazards.find(row => row.school === "S1" && row.state === "待整改"), beforeArchives = f.db.archives.length;
+  const result = f.run("admin", "hazard.rectify", { id: hazard.id, reason: "已补全标签和责任人并完成现场核对。", attachment: { name: "整改核对记录.txt", mime: "text/plain;charset=utf-8", content: "包装、标签、数量、存放条件和有效期均已核对。" } });
+  assert.equal(result.state, "待校内复核");
+  assert.equal(f.db.archives.length, beforeArchives + 1);
+  const file = byId(f.db, "archives", result.attachmentId);
+  assert.equal(file.relatedTable, "hazards");
+  assert.equal(file.relatedId, hazard.id);
+  assert.equal(file.state, "已归档");
+  assert.equal(result.submissionHistory.at(-1).attachmentId, file.id);
+  assert.deepEqual(M.auditRelations(f.db), []);
+});
+
 test("危化品隐患须依次经过校内复核和区级复查，且多隐患全部关闭后任务才完成", () => {
   const f = fixture();
   const stock = hazardStock(f.db);
   const admin = M.actorFor(f.db, "admin", "S1");
-  assert.ok(stock && admin);
+  const reviewer = f.db.staff.find(person => person.school === "S1" && person.role === "admin" && person.enabled && person.id !== admin.id);
+  assert.ok(stock && admin && reviewer);
 
   const task = f.run("district", "task.create", {
     safetyScope: "hazardous",
@@ -163,11 +177,12 @@ test("危化品隐患须依次经过校内复核和区级复查，且多隐患�
   f.reject("district", "hazard.verify", { id: first.id, approve: true, reason: "越过校内复核" }, /当前状态/);
   f.reject("district", "hazard.schoolReview", { id: first.id, approve: true, reason: "区级越权" }, /学校管理员/);
 
-  f.run("admin", "hazard.schoolReview", { id: first.id, approve: false, reason: "整改照片未显示标签责任人，请补充。" });
+  f.reject("admin", "hazard.schoolReview", { id: first.id, approve: false, reason: "本人不能复核。" }, /不能复核本人/, "S1", admin.id);
+  f.run("admin", "hazard.schoolReview", { id: first.id, approve: false, reason: "整改照片未显示标签责任人，请补充。" }, "S1", reviewer.id);
   row = byId(f.db, "hazards", first.id);
   assert.equal(row.state, "整改中");
   assert.equal(row.reviewHistory.length, 1);
-  assertReview(latest(row.reviewHistory), "school", false, admin.id);
+  assertReview(latest(row.reviewHistory), "school", false, reviewer.id);
   assert.equal(byId(f.db, "tasks", task.id).state, "待整改");
 
   const secondFile = submitRectification(f, first.id, "二");
@@ -176,11 +191,11 @@ test("危化品隐患须依次经过校内复核和区级复查，且多隐患�
   assert.equal(row.submissionHistory.length, 2);
   assert.equal(latest(row.submissionHistory).attachmentId, secondFile.id);
 
-  f.run("admin", "hazard.schoolReview", { id: first.id, approve: true, reason: "校内现场核验通过，提交区级复查。" });
+  f.run("admin", "hazard.schoolReview", { id: first.id, approve: true, reason: "校内现场核验通过，提交区级复查。" }, "S1", reviewer.id);
   row = byId(f.db, "hazards", first.id);
   assert.equal(row.state, "待区级复查");
   assert.equal(row.reviewHistory.length, 2);
-  assertReview(latest(row.reviewHistory), "school", true, admin.id);
+  assertReview(latest(row.reviewHistory), "school", true, reviewer.id);
   f.reject("admin", "hazard.schoolReview", { id: first.id, approve: true, reason: "重复复核" }, /当前状态/);
   f.reject("admin", "hazard.verify", { id: first.id, approve: true, reason: "学校越权区级复查" }, /区级管理员/);
 
@@ -191,18 +206,18 @@ test("危化品隐患须依次经过校内复核和区级复查，且多隐患�
   assertReview(latest(row.reviewHistory), "district", false, "DISTRICT");
 
   submitRectification(f, first.id, "三");
-  f.run("admin", "hazard.schoolReview", { id: first.id, approve: true, reason: "校内复核确认补充完整。" });
+  f.run("admin", "hazard.schoolReview", { id: first.id, approve: true, reason: "校内复核确认补充完整。" }, "S1", reviewer.id);
   f.run("district", "hazard.verify", { id: first.id, approve: true, reason: "区级复查确认整改到位，同意关闭。" });
   row = byId(f.db, "hazards", first.id);
   assert.equal(row.state, "已关闭");
   assert.equal(row.submissionHistory.length, 3);
   assert.equal(row.reviewHistory.length, 5);
-  assertReview(row.reviewHistory[3], "school", true, admin.id);
+  assertReview(row.reviewHistory[3], "school", true, reviewer.id);
   assertReview(row.reviewHistory[4], "district", true, "DISTRICT");
   assert.equal(byId(f.db, "tasks", task.id).state, "待整改", "同次检查仍有未关闭隐患时任务不能完成");
 
   submitRectification(f, second.id, "四");
-  f.run("admin", "hazard.schoolReview", { id: second.id, approve: true, reason: "第二项隐患校内复核通过。" });
+  f.run("admin", "hazard.schoolReview", { id: second.id, approve: true, reason: "第二项隐患校内复核通过。" }, "S1", reviewer.id);
   assert.equal(byId(f.db, "tasks", task.id).state, "待整改");
   f.run("district", "hazard.verify", { id: second.id, approve: true, reason: "第二项隐患区级复查通过。" });
   assert.equal(byId(f.db, "hazards", second.id).state, "已关闭");

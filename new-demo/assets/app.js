@@ -7,7 +7,7 @@
   const money = n => Number(n || 0).toLocaleString("zh-CN", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
   const pref = (key, fallback) => { try { return JSON.parse(sessionStorage.getItem(key)) ?? fallback; } catch { return fallback; } };
   const savePref = (key, value) => { try { sessionStorage.setItem(key, JSON.stringify(value)); } catch { /* Preferences are optional; business persistence is checked separately. */ } };
-  let db, persistenceError = "", actor, modalRevision = 0, modalSubmit = null, selected = new Set(), lastFocus, downloadResult, importResult, pendingFile, pendingResourceFile = null, pendingLoss = null, pendingSummaryImages = { OVERVIEW: [], STUDENT: [] };
+  let db, persistenceError = "", actor, modalRevision = 0, modalSubmit = null, selected = new Set(), lastFocus, downloadResult, importResult, pendingFile, pendingResourceFile = null, pendingLoss = null, pendingSummaryImages = { OVERVIEW: [], STUDENT: [] }, aiQueryTimer = null, aiQueryToken = 0;
   try {
     const navigation = performance.getEntriesByType("navigation")[0], forceSeed = !sessionStorage.getItem("lab-demo-seed-v20260903-accounts-v2") || navigation?.type === "reload";
     db = forceSeed ? M.seed() : M.migrate(JSON.parse(localStorage.getItem(M.KEY) || "null"));
@@ -34,7 +34,7 @@
   if (!subjectAllowed(savedSubject)) savedSubject = defaultSubject();
   const subjectLabel = value => M.subjectLabel ? M.subjectLabel(value) : value;
   const subjectOptions = () => [...(actor.role === "teacher" ? [] : [["ALL", "全部学科"]]), ...M.subjectOptionsFor(subjectValues())];
-  const view = { tab: new URLSearchParams(location.search).get("tab") || (pageId === "inspections" ? "checks" : ""), keyword: "", state: "", subject: savedSubject, grade: "", category: "", itemId: "", page: 1, date: "", endDate: "", year: M.TODAY.slice(0, 4), week: M.TODAY, term: activeTerm, school: "" };
+  const view = { tab: new URLSearchParams(location.search).get("tab") || (["safety", "inspections"].includes(pageId) ? "todos" : ""), keyword: "", state: "", subject: savedSubject, grade: "", category: "", itemId: "", page: 1, date: "", endDate: "", year: M.TODAY.slice(0, 4), week: M.TODAY, term: activeTerm, school: "", batchMode: false, todoType: "" };
   if (!db.terms.some(t => t.id === view.term)) view.term = db.terms[0].id;
   activeTerm = view.term;
   const baseMetrics = M.metrics;
@@ -73,7 +73,7 @@
     purchases: col("id:申请单号|schoolName:学校|itemsText:采购明细|total:预计金额（元）|applicant:申请人|date:申请日期|state:状态"),
     receipts: col("id:入库单号|schoolName:学校|itemsText:入库明细|total:入库金额（元）|supplier:供应商|date:登记日期|state:状态"),
     inventory: col("id:物品编号|name:名称|spec:规格|schoolName:学校|location:存放位置|stockText:当前库存|minText:补库阈值|hazardText:管理类别|state:库存状态"),
-    hazardInventory: col("id:库存编号|name:危化品名称|spec:规格|schoolName:学校|location:存放位置|stockText:现有库存|expiryText:有效期|custodian:保管责任人|riskText:风险状态"),
+    hazardInventory: col("name:危化品|location:存放位置|stockText:现有库存|expiryText:有效期|custodian:保管责任人|riskText:风险状态"),
     flows: col("id:业务单号|kind:业务类型|itemName:物品|qtyText:数量|applicant:申请人|reviewer:复核人|date:登记日期|state:记账状态"),
     plans: col("id:计划编号|name:计划名称|subject:学科|grade:年级|version:教材|termName:学期|targetCount:适用班级|itemCount:实验项|categorySummary:实验属性|taskCount:应开次数|doneCount:已完成|rate:完成率|state:计划状态"),
     planItems: col("experimentName:实验名称|experimentCategory:实验属性|sourceType:来源|chapter:章节|grade:年级|version:教材|scheduleText:建议时间|mode:实施方式|equipment:实验器材"),
@@ -166,7 +166,7 @@
     if (pageId === "experiments") return [["plans", "实验计划"], ["innovation", "创新实验"]];
     if (pageId === "schedule") return [["progress", "完成进度"], ["ranking", "学校排行"], ["subject", "学科分析"], ["grade", "年级对比"], ["class", "班级明细"]];
     if (pageId === "booking") return [["booked", "已预约实验"], ["arranged", "已安排实验"], ["pendingSummary", "待登记总结实验"], ["mineBooked", "我预约的实验"], ["mineArranged", "我的已安排实验"], ["minePendingSummary", "我的待登记总结实验"]];
-    if (["safety", "inspections"].includes(pageId)) return [["hazardInventory", "危化品台账"], ["hazards", "隐患与整改"], ["checks", "专项检查台账"], ["tasks", "检查任务"], ["hazardFlows", "出入库与复核"], ["generalSafety", "一般安全记录"]];
+    if (["safety", "inspections"].includes(pageId)) return [["todos", "待办"], ["hazardInventory", "危化品台账"], ["safetyCases", "检查与整改"]];
     if (pageId === "archives") return [["all", "全部资源"], ...M.resourceTypes.map(type => [type, type])];
     if (pageId === "settings") return [["settings", "平台设置"], ["terms", "学年学期"], ["periods", "学校节次"], ["logs", "操作日志"]];
     return [];
@@ -227,6 +227,31 @@
     if (view.keyword) rows = rows.filter(row => rawColumns.some(([key]) => String(row[key] ?? "").toLowerCase().includes(view.keyword.toLowerCase())));
     return { table, rows, allRows: rows, columns: rawColumns, reference: true };
   }
+  function safetyRiskLabels(stock) {
+    const labels = String(decorate("inventory", stock).riskText || "").split("、").filter(Boolean);
+    return labels.filter(label => label !== "正常" && label !== "补库提示");
+  }
+  function safetyTodoRows() {
+    const rows = [], hazardous = row => row.safetyScope === "hazardous";
+    records("inventory").filter(stock => M.isHazard(M.itemOf(db, stock))).forEach(stock => {
+      const item = M.itemOf(db, stock), decorated = decorate("inventory", stock), risks = safetyRiskLabels(stock);
+      if (risks.length) rows.push({ id: `safety-risk:${stock.id}`, recordId: stock.id, _table: "inventory", todoGroup: "safety-risk", todoType: "安全预警", targetLabel: `${item?.name || stock.id} · ${decorated.location}`, summary: risks.join("、"), owner: decorated.custodian, due: stock.expiry || "尽快核查", state: risks[0] });
+      if (Number(stock.stock) < Number(stock.min)) rows.push({ id: `restock:${stock.id}`, recordId: stock.id, _table: "inventory", todoGroup: "restock", todoType: "补库提醒", targetLabel: `${item?.name || stock.id} · ${decorated.location}`, summary: `现有${decorated.stockText}，低于补库阈值${decorated.minText}`, owner: decorated.custodian, due: "按教学需求", state: "库存不足" });
+    });
+    records("tasks").filter(row => hazardous(row) && row.state === "待检查").forEach(row => rows.push({ id: `inspection:${row.id}`, recordId: row.id, _table: "tasks", todoGroup: "inspection", todoType: "待执行检查", targetLabel: M.safetyTargetLabel(db, row), summary: row.kind || "危化品专项检查", owner: row.owner || "未指定", due: row.due || "未登记", state: row.state }));
+    records("flows").filter(row => row.state === "待复核" && M.isHazard(M.itemOf(db, get("inventory", row.itemId)))).forEach(row => { const stock = get("inventory", row.itemId), item = M.itemOf(db, stock); rows.push({ id: `flow-review:${row.id}`, recordId: row.id, _table: "flows", todoGroup: "review", todoType: "库存复核", targetLabel: `${item?.name || row.itemId} · ${row.kind}${row.qty}${item?.unit || ""}`, summary: row.applicantId === actor.id ? "本人提交，需由另一名管理员复核" : "核对数量、用途与双人复核要求", owner: row.applicant || "未登记", due: row.date || "未登记", state: row.state }); });
+    records("hazards").filter(row => hazardous(row) && row.state !== "已关闭").forEach(row => { const reviewState = scope === "district" ? "待区级复查" : "待校内复核", group = row.state === reviewState ? "review" : "rectification"; rows.push({ id: `hazard:${row.id}`, recordId: row.id, _table: "hazards", todoGroup: group, todoType: group === "review" ? reviewState : "整改处理中", targetLabel: M.safetyTargetLabel(db, row), summary: row.title, owner: row.owner || "未指定", due: row.due || "未登记", state: row.state }); });
+    return rows.filter(row => !view.todoType || row.todoGroup === view.todoType);
+  }
+  function safetyCaseRows() {
+    const rows = [], hazardous = row => row.safetyScope === "hazardous";
+    records("tasks").filter(row => hazardous(row) && !row.checkId).forEach(row => rows.push({ id: `task:${row.id}`, recordId: row.id, _table: "tasks", caseLabel: row.kind || "危化品专项检查", targetLabel: M.safetyTargetLabel(db, row), sourceText: row.sourceType === "district" ? "区级任务" : "学校自查", progressText: "待填报检查结果", owner: row.owner || "未指定", due: row.due || "未登记", state: row.state }));
+    records("checks").filter(hazardous).forEach(checkRow => {
+      const hazards = records("hazards").filter(hazard => hazard.checkId === checkRow.id), active = hazards.find(hazard => hazard.state !== "已关闭") || hazards[0], actual = active || checkRow, table = active ? "hazards" : "checks", closed = hazards.length && hazards.every(hazard => hazard.state === "已关闭");
+      rows.push({ id: `case:${checkRow.id}`, recordId: actual.id, _table: table, caseLabel: `${checkRow.kind || "危化品检查"} · ${checkRow.date}`, targetLabel: M.safetyTargetLabel(db, checkRow), sourceText: checkRow.taskId ? "区级任务" : "学校自查", progressText: hazards.length ? `${hazards.length}项隐患 · ${closed ? "均已关闭" : active.state}` : "检查正常，无隐患", owner: active?.owner || checkRow.inspector || "未指定", due: active?.due || checkRow.date || "未登记", state: active?.state || checkRow.result });
+    });
+    return rows;
+  }
   function dataset() {
     const tabs = tabsFor(); if (!tabs.some(([id]) => id === view.tab)) view.tab = tabs[0]?.[0] || "";
     let table = "", rows = [], t = view.tab;
@@ -237,7 +262,7 @@
     else if (["devices", "equipment"].includes(pageId)) table = t;
     else if (pageId === "experiments") table = t === "innovation" ? "customExperiments" : "plans";
     else if (pageId === "booking") table = "bookings";
-    else if (["safety", "inspections"].includes(pageId)) table = t === "hazardInventory" ? "inventory" : t === "hazardFlows" ? "flows" : t === "generalSafety" ? "hazards" : t;
+    else if (["safety", "inspections"].includes(pageId)) table = t === "todos" ? "safetyTodos" : t === "hazardInventory" ? "inventory" : t === "safetyCases" ? "safetyCases" : t;
     else if (pageId === "archives") table = "resources";
     else if (pageId === "schedule") table = "report";
     if (view.classId) {
@@ -246,6 +271,8 @@
     }
     if (table === "settings") return { table, rows: [], columns: [] };
     if (table === "report") { rows = M.teaching(db, school(), view.term, ["subject", "grade", "class"].includes(t) ? t : "school", teachingFilters({ subject: view.subject, grade: view.grade, teacherId: view.teacherId, classId: view.classId })); if (t === "ranking") rows.sort((a, b) => (b.done / (b.required || 1)) - (a.done / (a.required || 1))); }
+    else if (table === "safetyTodos") rows = safetyTodoRows();
+    else if (table === "safetyCases") rows = safetyCaseRows();
     else rows = (db[table] ? (["terms"].includes(table) ? db[table] : records(table)) : []).map(r => decorate(table, r));
     if (table === "staff") rows = rows.filter(r => t === "all" || (t === "disabled" ? !r.enabled : r.role === t && r.enabled));
     if (table === "inventory" && t === "hazard") rows = rows.filter(r => r.hazard);
@@ -269,9 +296,9 @@
     if (table === "resources" && t !== "all") rows = rows.filter(r => r.resourceType === t);
     if (actor.role === "teacher" && table === "resources") rows = rows.filter(r => r.school === actor.school);
     const allRows = rows;
-    const rawColumns = table === "inventory" && t === "hazardInventory" ? columns.hazardInventory : table === "flows" && t === "loss" ? col("date:损耗日期|classificationCode:分类编号|itemName:名称|spec:规格|unit:单位|qty:数量|total:总价（元）|location:存放位置（房间／橱柜）|reason:损耗原因|state:状态") : table === "report" && t === "class" ? [...col("gradeNames:年级|teacherNames:任课教师"), ...columns.report] : columns[table] || [];
+    const rawColumns = table === "safetyTodos" ? col("todoType:待办类型|targetLabel:对象|summary:待办内容|owner:责任人|due:期限/日期|state:当前状态") : table === "safetyCases" ? col("caseLabel:检查事项|targetLabel:对象|sourceText:来源|progressText:处理进度|owner:责任人|due:期限|state:状态") : table === "inventory" && t === "hazardInventory" ? columns.hazardInventory : table === "flows" && t === "loss" ? col("date:损耗日期|classificationCode:分类编号|itemName:名称|spec:规格|unit:单位|qty:数量|total:总价（元）|location:存放位置（房间／橱柜）|reason:损耗原因|state:状态") : table === "report" && t === "class" ? [...col("gradeNames:年级|teacherNames:任课教师"), ...columns.report] : columns[table] || [];
     const visibleColumns = schoolScopeColumns(rawColumns);
-    rows = rows.filter(r => (!view.state || (table === "inventory" && view.tab === "hazardInventory" ? String(r.riskText || "").split("、").includes(view.state) : (r.state || r.result) === view.state)) && rowMatchesSubject(table, r) && (table === "report" || table === "resources" || (!view.grade || r.grade === view.grade)) && (table !== "resources" || (!view.grade || (r.grades || []).includes(view.grade)) && (!view.category || r.experimentCategory === view.category)) && (!view.keyword || visibleColumns.some(([k]) => String(r[k] ?? "").toLowerCase().includes(view.keyword.toLowerCase()))));
+    rows = rows.filter(r => (!view.state || (table === "inventory" && view.tab === "hazardInventory" ? String(r.riskText || "").split("、").includes(view.state) : (r.state || r.result) === view.state)) && (["safetyTodos", "safetyCases"].includes(table) || rowMatchesSubject(table, r)) && (table === "report" || table === "resources" || (!view.grade || r.grade === view.grade)) && (table !== "resources" || (!view.grade || (r.grades || []).includes(view.grade)) && (!view.category || r.experimentCategory === view.category)) && (!view.keyword || visibleColumns.some(([k]) => String(r[k] ?? "").toLowerCase().includes(view.keyword.toLowerCase()))));
     return { table, rows, allRows, columns: visibleColumns };
   }
   function commit(command, payload, expected = modalRevision) {
@@ -381,7 +408,52 @@
     html += `<h3>处理轨迹</h3>${miniTable(col("at:时间|actor:操作人|action:操作|note:说明"), db.logs.filter(l => l.table === table && l.recordId === id).slice().reverse())}<div class="detail-actions">${rowActions(table, r, false)}</div>`;
     openModal(`${table === "inventory" && M.isHazard(stored) ? "危化品库存" : M.tableNames[table]}详情`, html);
   }
+  function safetyInlineActions(table, row) {
+    const id = row.recordId || row.id, stored = get(table, id), r = stored ? { ...stored, ...decorate(table, stored) } : row;
+    const b = (label, action, primary = false, extra = "") => button(label, action, `data-table="${table}" data-id="${h(id)}" ${extra}`, primary);
+    let main = "", hasMore = false;
+    if (table === "inventory" && scope === "school" && !r.pendingReceiptId) {
+      const item = M.itemOf(db, r), usable = roomFitsStoredItem(get("rooms", r.roomId), item), available = flowAvailableStock(r), expired = expiredHazardStock(r);
+      if (r.roomId && usable && !expired && available > 0) main = b("领用", "flow", true, 'data-kind="领用"');
+      else if (r.roomId && usable && !expired) main = b("补充入库", "flow", true, 'data-kind="入库"');
+      else main = b("查看并处理", "detail", true);
+      hasMore = permit("admin");
+    }
+    if (table === "flows" && r.state === "待复核" && scope === "school") {
+      if (permit("admin") && r.applicantId !== actor.id) main = b("复核", "decide", true);
+      else return '<span class="row-action-note">需另一名管理员复核</span>';
+    }
+    if (table === "tasks" && r.state === "待检查" && scope === "school") main = b("填报检查", "check-new", true);
+    if (table === "tasks" && r.state === "待检查" && scope === "district") { main = b("修改任务", "task-edit", true); hasMore = true; }
+    if (table === "checks") hasMore = scope === "school" && permit("admin") && !db.hazards.some(hazard => hazard.checkId === r.id);
+    if (table === "hazards") {
+      if (scope === "school" && ["待整改", "整改中"].includes(r.state)) { main = b("办理整改", "hazard-rectify", true); hasMore = permit("admin"); }
+      if (scope === "school" && r.state === "待校内复核") {
+        if (permit("admin") && r.submitterId !== actor.id) main = b("校内复核", "hazard-school-review", true);
+        else return '<span class="row-action-note">需另一名管理员复核</span>';
+      }
+      if (scope === "district" && r.state === "待区级复查") main = b("区级复查", "hazard-district-review", true);
+    }
+    if (hasMore) main += b("更多", "safety-more");
+    return main;
+  }
+  function safetyMoreActions(table, id) {
+    const r = get(table, id); if (!r) throw new Error("记录已变更，请刷新后重试。");
+    const b = (label, action, extra = "") => button(label, action, `data-table="${table}" data-id="${h(id)}" ${extra}`);
+    let actions = "";
+    if (table === "inventory" && scope === "school") {
+      const item = M.itemOf(db, r), usable = roomFitsStoredItem(get("rooms", r.roomId), item), expired = expiredHazardStock(r);
+      if (r.roomId && usable && !expired) actions += b("补充入库", "flow", 'data-kind="入库"');
+      if (returnableSourcesFor(r.id).length) actions += b("办理退回", "flow", 'data-kind="退回"');
+      actions += b("调整存放位置", "storage-move") + b("维护库存档案", "inventory-edit");
+    }
+    if (table === "tasks" && scope === "district") actions += b("删除任务", "task-delete-record");
+    if (table === "checks" && scope === "school" && !db.hazards.some(hazard => hazard.checkId === r.id)) actions += b("修改检查记录", "check-edit");
+    if (table === "hazards" && scope === "school" && ["待整改", "整改中"].includes(r.state)) actions += b("修改隐患信息", "hazard-edit");
+    openModal("更多操作", `<div class="more-action-list">${actions || '<p class="help">当前记录没有其他可用操作。</p>'}</div><p class="help">损耗、处置、删除等高影响操作请进入记录详情后办理。</p>`);
+  }
   function rowActions(table, r, includeView = true) {
+    if (["safety", "inspections"].includes(pageId) && includeView) return safetyInlineActions(r._table || table, r);
     const b = (label, action, allowed = true, extra = "") => button(label, action, `data-table="${table}" data-id="${h(r.id)}" ${extra}`, false, allowed);
     let out = table === "logs" || !includeView ? "" : b("查看", "detail");
     if (table === "repairRegisters") return scope === "school" ? b("修改", "repair-edit", permit("admin", "teacher")) + b("删除", "repair-delete", permit("admin")) : "";
@@ -414,9 +486,9 @@
     if (table === "tasks") { if (scope === "school" && r.state === "待检查") out += b("填报检查", "check-new", permit("admin")); if (scope === "district" && r.state === "待检查") out += b("修改", "task-edit") + b("删除", "task-delete-record"); }
     if (table === "checks" && scope === "school" && !db.hazards.some(hazard => hazard.checkId === r.id)) out += b("修改", "check-edit", permit("admin")) + b("删除", "check-delete", permit("admin"));
     if (table === "hazards") {
-      if (scope === "school" && ["待整改", "整改中"].includes(r.state)) out += b("修改", "hazard-edit", permit("admin")) + b("整改附件", "attachment", permit("admin")) + b("提交整改", "hazard-submit", permit("admin"));
+      if (scope === "school" && ["待整改", "整改中"].includes(r.state)) out += b("修改", "hazard-edit", permit("admin")) + b("办理整改", "hazard-rectify", permit("admin"));
       if (scope === "school" && r.state === "待整改") out += b("删除", "hazard-delete", permit("admin"));
-      if (scope === "school" && r.state === "待校内复核") out += b("校内复核", "hazard-school-review", permit("admin"));
+      if (scope === "school" && r.state === "待校内复核") out += b("校内复核", "hazard-school-review", permit("admin") && r.submitterId !== actor.id);
       if (scope === "district" && r.state === "待区级复查") out += b("区级复查", "hazard-district-review", permit("district"));
     }
     if (table === "resources") { const canMaintain = permit("admin") || r.uploaderId === actor.id && subjectAllowed(r.subject); out += b("预览", "resource-preview"); out += b("下载", "resource-download"); out += b("编辑", "resource-edit", canMaintain); out += b("删除", "resource-delete", canMaintain); }
@@ -424,6 +496,12 @@
     return out;
   }
   function actionsFor(table) {
+    if (["safety", "inspections"].includes(pageId)) {
+      const batch = button("批量导出", "batch-start");
+      if (scope === "district") return batch + (view.tab === "hazardInventory" ? button("生成风险清单", "risk-report", "", true) : button("发起专项检查", "task-new", "", true));
+      if (view.tab === "hazardInventory") return batch + button("期初建账", "inventory-edit", "", true, permit("admin"));
+      return batch + button("新增学校自查", "check-new", "", true, permit("admin"));
+    }
     if (["consumableTotal", "consumableLedger", "lossRegisters", "repairRegisters", "scrapRegisters"].includes(table)) {
       let out = button("导出Excel", "export");
       if (scope === "school" && table === "lossRegisters") out += button("登记损耗", "loss-new", "", true, permit("admin"));
@@ -453,14 +531,15 @@
   function safetyOverview() {
     const stocks = records("inventory").filter(row => M.isHazard(M.itemOf(db, row))), openHazards = records("hazards").filter(row => row.safetyScope === "hazardous" && row.state !== "已关闭"), overdue = openHazards.filter(row => row.due && row.due < M.TODAY), pendingChecks = records("tasks").filter(row => row.safetyScope === "hazardous" && row.state === "待检查"), reviewState = scope === "district" ? "待区级复查" : "待校内复核", pendingReviews = openHazards.filter(row => row.state === reviewState), riskStocks = stocks.filter(row => {
       const linked = openHazards.some(hazard => M.safetyRelatedToStock(db, hazard, row)), expiryRisk = row.expiry && row.expiry <= addDays(M.TODAY, 30);
-      return !row.roomId || row.stock < row.min || expiryRisk || linked || row.pendingReceiptId;
+      return !row.roomId || expiryRisk || linked || row.pendingReceiptId;
     });
-    const metric = (value, label, tone = "") => `<div class="summary-item ${tone}"><div class="summary-value">${h(value)}</div><div class="summary-label">${h(label)}</div></div>`;
-    return `<section class="safety-overview" aria-label="危化品安全概览"><div class="safety-overview-head"><div><strong>危化品安全概览</strong><p>以危化品库存为对象，集中查看存放、有效期、检查和整改状态。</p></div><div class="safety-overview-actions">${button("查看危化品台账", "tab", 'data-tab="hazardInventory"')}${scope === "district" ? button("生成风险清单", "risk-report") : ""}</div></div><div class="summary-strip">${metric(stocks.length, scope === "district" ? "危化品库存记录" : "本校危化品库存")}${metric(riskStocks.length, "需要关注的库存", riskStocks.length ? "risk" : "")}${metric(pendingChecks.length, "待执行专项检查", pendingChecks.length ? "risk" : "")}${metric(pendingReviews.length, reviewState, pendingReviews.length ? "risk" : "")}</div><p class="safety-overview-note">检查应覆盖账物核对、存放条件、包装标识、有效期、领用复核和待处置物品。整改材料先由学校管理员复核，通过后进入区级复查；任一级驳回均退回继续整改。当前另有${h(overdue.length)}项危化品隐患逾期未关闭。</p></section>`;
+    const restock = stocks.filter(row => Number(row.stock) < Number(row.min)), metric = (value, label, group, tone = "") => `<button type="button" class="summary-item ${tone} ${view.todoType === group ? "active" : ""}" data-action="todo-filter" data-todo-type="${group}"><span class="summary-value">${h(value)}</span><span class="summary-label">${h(label)}</span></button>`;
+    return `<section class="safety-overview" aria-label="危化品安全概览"><div class="safety-overview-head"><div><strong>危化品安全概览</strong><p>先处理待办；历史流水、检查和整改轨迹保留在对应详情中。</p></div><div class="safety-overview-actions">${button("查看危化品台账", "tab", 'data-tab="hazardInventory"')}</div></div><div class="summary-strip">${metric(riskStocks.length, "安全预警", "safety-risk", riskStocks.length ? "risk" : "")}${metric(restock.length, "补库提醒", "restock")}${metric(pendingChecks.length, "待执行检查", "inspection", pendingChecks.length ? "risk" : "")}${metric(pendingReviews.length + records("flows").filter(row => row.state === "待复核" && M.isHazard(M.itemOf(db, get("inventory", row.itemId)))).length, "待复核", "review", pendingReviews.length ? "risk" : "")}</div><p class="safety-overview-note">补库提醒与安全风险分开计算，避免把库存不足误判为安全事故。当前有${h(overdue.length)}项危化品隐患逾期未关闭。</p></section>`;
   }
   function listView(data) {
     if (data.table === "settings") return settingsView();
     if (pageId === "archives") return resourceListView(data);
+    const safetyPage = ["safety", "inspections"].includes(pageId), showSelect = !safetyPage || view.batchMode;
     const states = data.table === "inventory" && view.tab === "hazardInventory" ? [...new Set(data.allRows?.flatMap(r => String(r.riskText || "").split("、")).filter(Boolean))] : [...new Set(data.allRows?.map(r => r.state || r.result).filter(Boolean))];
     const start = (view.page - 1) * 8; if (start >= data.rows.length && view.page > 1) view.page = 1;
     const pageRows = data.rows.slice((view.page - 1) * 8, view.page * 8), max = Math.max(1, Math.ceil(data.rows.length / 8));
@@ -473,10 +552,20 @@
     const subjectFilter = !subjectContextEnabled() && !["safety", "inspections"].includes(pageId) && (data.table === "report" || data.allRows?.some(r => r.subject)) ? field("subject", "学科", view.subject, "text", [["", "全部学科"], ...M.subjectOptionsFor(), ["综合", "综合"].filter((value, index, arr) => arr.indexOf(value) === index)], false) : "";
     const filters = data.reference ? referenceFilterFields(data.table) : field("keyword", "关键词", view.keyword, "text", null, false) + (states.length ? field("state", "状态", view.state, "text", [["", "全部状态"], ...states], false) : "") + subjectFilter + (["report", "bookings", "plans", "planItems", "teachingTasks", "classes"].includes(data.table) ? field("grade", "年级", view.grade, "text", [["", "全部年级"], ...new Set(db.classes.map(c => c.grade))], false) : "") + extraFilters;
     const showActions = !data.reference || scope === "school" && ["repairRegisters", "scrapRegisters", "lossRegisters"].includes(data.table);
-    return `${["safety", "inspections"].includes(pageId) ? safetyOverview() : ""}${pageId === "booking" ? calendar() : ""}${["devices", "equipment"].includes(pageId) ? `<section class="scanner"><div><strong>资产编号查询</strong><p class="help">扫描条码或输入编号；支持扫码枪键盘输入后回车。</p></div><form id="scanForm" class="compose-row"><input class="input" name="code" aria-label="资产编号" placeholder="例如 QP001-2024-001" required><button class="button primary" type="submit">查询</button></form></section>` : ""}${tabsMarkup()}
+    const recordCell = (r, key) => {
+      const value = r[key] ?? "未填写", actualTable = r._table || data.table, actualId = r.recordId || r.id;
+      if (safetyPage && ["name", "targetLabel", "caseLabel"].includes(key)) {
+        const sub = key === "name" ? `<small>${h(r.spec || "规格未登记")} · ${h(actualId)}</small>` : "";
+        return `<button type="button" class="table-record-link" data-action="detail" data-table="${h(actualTable)}" data-id="${h(actualId)}"><strong>${h(value)}</strong>${sub}</button>`;
+      }
+      return key === "state" || key === "result" || key === "riskText" ? status(value) : h(value);
+    };
+    const batchToolbar = safetyPage && view.batchMode ? `<div class="batch-toolbar"><span>批量导出模式 · 已选 ${selected.size} 条</span><div class="inline-actions">${button("导出已选", "batch-export", "", true, selected.size > 0)}${button("导出当前结果", "export-all")}${button("退出批量", "batch-cancel")}</div></div>` : "";
+    const activeTodoFilter = safetyPage && view.tab === "todos" && view.todoType ? `<div class="active-filter"><span>已按概览指标筛选待办</span>${button("清除筛选", "todo-filter", 'data-todo-type=""')}</div>` : "";
+    return `${safetyPage && view.tab === "todos" ? safetyOverview() : ""}${pageId === "booking" ? calendar() : ""}${["devices", "equipment"].includes(pageId) ? `<section class="scanner"><div><strong>资产编号查询</strong><p class="help">扫描条码或输入编号；支持扫码枪键盘输入后回车。</p></div><form id="scanForm" class="compose-row"><input class="input" name="code" aria-label="资产编号" placeholder="例如 QP001-2024-001" required><button class="button primary" type="submit">查询</button></form></section>` : ""}${tabsMarkup()}
       <section class="table-panel"><form class="filter-bar" id="filterForm">${filters}<div class="filter-actions"><button class="button primary" type="submit">查询</button>${button("重置", "filter-reset")}</div></form>
-      <div class="table-wrap"><table class="data-table"><thead><tr><th><input type="checkbox" id="selectAll" aria-label="选择本页记录"></th>${data.columns.map(([, label]) => `<th scope="col">${h(label)}</th>`).join("")}${showActions ? "<th>操作</th>" : ""}</tr></thead><tbody>${pageRows.map(r => `<tr><td><input type="checkbox" data-select="${h(r.id)}" aria-label="选择 ${h(r.name || r.id)}" ${selected.has(r.id) ? "checked" : ""}></td>${data.columns.map(([key]) => `<td${["name", "experimentName", "chapter", "itemsText", "reason", "title", "note", "relatedName", "riskText"].includes(key) || String(r[key] ?? "").length > 24 ? ' class="cell-wrap"' : ""}>${key === "state" || key === "result" || key === "riskText" ? status(r[key] || "未填写") : h(r[key] ?? "未填写")}</td>`).join("")}${showActions ? `<td><div class="row-actions">${data.table === "report" ? button("查看明细", "report-plans", `data-name="${h(r.name)}"`) : rowActions(data.table, r)}</div></td>` : ""}</tr>`).join("") || `<tr><td colspan="${data.columns.length + (showActions ? 2 : 1)}"><div class="empty-message">当前条件下暂无记录。可更换筛选条件，或通过页面上方操作新增业务。</div></td></tr>`}</tbody></table></div>
-      <footer class="table-footer"><span>筛选结果 ${data.rows.length} 条 · 已选 ${selected.size} 条 · 每页8条</span><div class="pagination">${button("上一页", "page-prev", "", false, view.page > 1)}<span>${view.page} / ${max}</span>${button("下一页", "page-next", "", false, view.page < max)}</div></footer></section>
+      ${activeTodoFilter}${batchToolbar}<div class="table-wrap"><table class="data-table"><thead><tr>${showSelect ? '<th><input type="checkbox" id="selectAll" aria-label="选择本页记录"></th>' : ""}${data.columns.map(([, label]) => `<th scope="col">${h(label)}</th>`).join("")}${showActions ? "<th>操作</th>" : ""}</tr></thead><tbody>${pageRows.map(r => `<tr>${showSelect ? `<td><input type="checkbox" data-select="${h(r.id)}" aria-label="选择 ${h(r.name || r.targetLabel || r.id)}" ${selected.has(r.id) ? "checked" : ""}></td>` : ""}${data.columns.map(([key]) => `<td${["name", "experimentName", "chapter", "itemsText", "reason", "title", "note", "relatedName", "riskText", "targetLabel", "summary", "caseLabel", "progressText"].includes(key) || String(r[key] ?? "").length > 24 ? ' class="cell-wrap"' : ""}>${recordCell(r, key)}</td>`).join("")}${showActions ? `<td><div class="row-actions">${data.table === "report" ? button("查看明细", "report-plans", `data-name="${h(r.name)}"`) : rowActions(data.table, r)}</div></td>` : ""}</tr>`).join("") || `<tr><td colspan="${data.columns.length + (showActions ? 1 : 0) + (showSelect ? 1 : 0)}"><div class="empty-message">当前条件下暂无记录。可更换筛选条件，或通过页面上方操作新增业务。</div></td></tr>`}</tbody></table></div>
+      <footer class="table-footer"><span>筛选结果 ${data.rows.length} 条${showSelect ? ` · 已选 ${selected.size} 条` : ""} · 每页8条</span><div class="pagination">${button("上一页", "page-prev", "", false, view.page > 1)}<span>${view.page} / ${max}</span>${button("下一页", "page-next", "", false, view.page < max)}</div></footer></section>
       ${["schedule", "experiments"].includes(pageId) ? '<p class="help">统计口径：计划实验按“必做、选做、创新实验”分别计数，并按适用班级形成应开次数；只有对应实验安排提交总结后计入实开。计划列表汇总展示各班执行进度。</p>' : ""}`;
   }
   function resourceListView(data) {
@@ -935,8 +1024,8 @@
     downloadResult = { name: `橱柜卡-${row.code || id}-${M.TODAY}.html`, content: downloadableReport(`橱柜卡 · ${row.code || id}`, html) };
     openModal(`橱柜卡 · ${row.code || id}`, `${html}<div class="detail-actions">${button("下载柜卡（HTML）", "report-download", "", true)}</div>`);
   }
-  function exportList() {
-    const data = dataset(), rows = selected.size ? data.rows.filter(r => selected.has(r.id)) : data.rows;
+  function exportList(mode = "auto") {
+    const data = dataset(), rows = mode === "selected" ? data.rows.filter(r => selected.has(r.id)) : mode === "all" ? data.rows : selected.size ? data.rows.filter(r => selected.has(r.id)) : data.rows;
     if (!rows.length) throw new Error("当前筛选或选中范围没有可导出记录。");
     const content = M.csv([data.columns.map(([, l]) => l), ...rows.map(r => data.columns.map(([k]) => r[k] ?? ""))]);
     const exportNames = { consumableTotal: "易耗品总账", consumableLedger: "易耗品分类账", lossRegisters: "易耗品损耗登记", repairRegisters: "仪器设备维修", scrapRegisters: "仪器设备报废" };
@@ -951,6 +1040,16 @@
  function importForm() {
    importResult = null;
     openModal("模板导入并生成入库单", fieldsForm(`<div class="full"><p class="help">使用UTF-8 CSV（Excel可另存为CSV UTF-8），模板列与下方“物品明细”字段一致：分类编号、物品名称、规格型号、分类、单位、管理方式、需要周期维保、数量、单价、存放位置（房间）、橱柜编号（可选）、下次维保日期、有效期。兼容旧版12列表头；1—30行、总量不超过100件。填写橱柜编号时必须同时填写所属房间编号。供应商、登记日期、购置日期和备注仍在本弹窗中填写。</p><div class="inline-actions">${button("下载CSV模板", "template-download")}${button("填入内容", "import-example")}</div><label class="field"><span class="field-label">选择CSV文件</span><input type="file" id="importFile" accept=".csv,text/csv"></label></div>` + field("source", "模板内容", "", "textarea", null, true, 'rows="6"') + `<div class="full">${button("校验并预览", "import-preview")}<div id="importPreview" aria-live="polite"></div></div>` + receiptFields()), v => { const validation = M.validateImport(v.source, db, actor.school); if (validation.errors.length) throw new Error(validation.errors.join("\n")); if (!importResult || importResult.source !== v.source) throw new Error("请先校验当前内容并确认预览。"); const result = commit("receipt.create", { ...v, items: validation.items }); closeModal(); render(); detail("receipts", result.id); }, "确认导入入库");
+  }
+  function hazardRectificationForm(id) {
+    const row = get("hazards", id); if (!row) throw new Error("隐患记录不存在或已变更。");
+    pendingFile = null;
+    openModal("办理隐患整改", fieldsForm(`<div class="full rectification-context"><strong>${h(row.title)}</strong><p class="help">${h(M.safetyTargetLabel(db, row))} · 整改期限 ${h(row.due || "未登记")}</p></div>${field("reason", "整改措施及完成情况", row.rectification || "", "textarea", null, true, 'rows="5" maxlength="500"')}<div class="full"><label class="field"><span class="field-label">整改佐证材料 <span class="required">*</span></span><input type="file" id="attachmentFile" accept=".pdf,.png,.jpg,.jpeg,.txt,.csv,.docx,.xlsx"></label><p class="help" id="fileStatus">支持文档、表格、图片或文本，最大512KB；也可生成TXT核对记录。</p>${button("生成整改核对记录", "rectification-example", `data-id="${h(id)}"`)}</div>${field("name", "材料文件名", `危化品整改核对记录-${id}.txt`)}${field("content", "文本材料内容（上传文件后无需填写）", "", "textarea", null, false, 'rows="6"')}`), values => {
+      if (pendingFile && values.name !== pendingFile.name) throw new Error("上传材料须保留原文件名。");
+      const attachment = pendingFile || { name: values.name, content: values.content, mime: "text/plain;charset=utf-8", dataUrl: "" };
+      if (!attachment.content && !attachment.dataUrl) throw new Error("请上传整改佐证材料，或生成并填写文本核对记录。");
+      const result = commit("hazard.rectify", { id, reason: values.reason, attachment }); closeModal(); render(); detail("hazards", result.id); toast("整改材料已提交，等待另一名管理员校内复核。");
+    }, "提交校内复核");
   }
   function attachmentForm(table, id) {
     pendingFile = null;
@@ -1122,7 +1221,14 @@
   function aiView() {
     return `<div class="ai-layout"><section class="ai-chat"><div class="ai-messages"><div class="message"><span class="message-avatar" aria-hidden="true">AI</span><div class="message-bubble">可以查询设备、耗材、教学完成、安全、维修和人员信息。结果来自当前学校范围及学期台账。</div></div><div id="aiResult" aria-live="polite"><p class="help">输入问题后展示可核对的明细与统计口径。</p></div></div><div class="ai-compose"><form id="askForm" class="compose-row"><input class="input" name="question" placeholder="例如：哪些耗材需要补库？" required aria-label="输入台账问题"><button type="submit" class="button primary">查询</button></form></div></section><aside class="ai-side"><section class="topic-card"><h2 class="topic-title">常用问题</h2><div class="topic-list">${["设备有多少，原值是多少？", "哪些耗材库存不足？", "本学期必做实验完成情况？", "还有哪些安全隐患未关闭？"].map(q => `<button type="button" class="topic-button" data-action="ask-example" data-question="${h(q)}">${h(q)}</button>`).join("")}</div></section><section class="topic-card"><h2 class="topic-title">支持查询</h2><p class="help">支持设备、库存、教学、安全、维修和人员查询；未知问题会说明能力边界，可下载已生成的查询结果。</p></section></aside></div>`;
   }
-  function ask(question) {
+  function stopAiQuery() {
+    if (aiQueryTimer !== null) {
+      if (typeof clearTimeout === "function") clearTimeout(aiQueryTimer);
+      aiQueryTimer = null;
+    }
+    aiQueryToken += 1;
+  }
+  function renderAiQuery(question) {
     let table, rows, answer; const subject = isAllSubject(view.subject) ? "" : view.subject, m = M.metrics(db, school(), view.term, subject);
     if (/耗材|库存|补库|危化/.test(question)) { table = "inventory"; rows = records(table).filter(i => rowMatchesSubject(table, i)).filter(i => /不足|低|补库/.test(question) ? i.stock < i.min : /危化/.test(question) ? M.isHazard(M.itemOf(db, i)) : true); answer = `匹配${rows.length}种物品；当前范围库存低于阈值的共${m.low}种。`; }
     else if (/隐患|安全|整改|检查/.test(question)) { table = "hazards"; rows = records(table).filter(r => /未|待|还有/.test(question) ? r.state !== "已关闭" : true); answer = `已记录${m.hazards}项隐患，已关闭${m.closed}项，闭环率${m.closure}。`; }
@@ -1133,6 +1239,25 @@
     else { $("#aiResult").innerHTML = '<div class="query-answer"><strong>暂不支持此类问题。</strong><p>可以查询设备数量、库存不足、教学完成、安全隐患、维修记录或人员信息。</p></div>'; return; }
     const shown = table === "report" ? rows : rows.map(r => decorate(table, r)), html = `<div class="query-answer"><h3>${h(question)}</h3><p>${h(answer)}</p><p class="help">来源：${h(M.tableNames[table] || "教学计划与完成登记")} · 范围：${h(school() ? name("schools", school()) : "全部学校")} · 学期：${h(name("terms", view.term))} · 版本：${db.revision} · 统计日期：${M.TODAY}</p>${miniTable(columns[table], shown)}${button("下载问数结果（HTML）", "report-download")}</div>`;
     downloadResult = { name: `智能问数结果-${M.TODAY}.html`, content: downloadableReport("智能问数 · 查询结果", html.replace(/<button[\s\S]*?<\/button>/g, "")) }; $("#aiResult").innerHTML = html;
+  }
+  function ask(question) {
+    stopAiQuery();
+    const result = $("#aiResult"), form = $("#askForm"), submit = form?.querySelector("button[type=submit]"), submitLabel = submit?.textContent || "查询", token = aiQueryToken, scopeLabel = scope === "district" ? "区域学校台账" : "本校台账";
+    if (!result) return;
+    downloadResult = null;
+    result.setAttribute("aria-busy", "true");
+    result.innerHTML = `<div class="query-loading" role="status"><span class="query-loading-spinner" aria-hidden="true"></span><div><strong>正在查询${scopeLabel}</strong><p class="help">正在读取台账并核对统计口径，请稍候…</p></div></div>`;
+    if (submit) { submit.disabled = true; submit.textContent = "查询中…"; }
+    $$(".topic-button").forEach(button => { button.disabled = true; });
+    aiQueryTimer = setTimeout(() => {
+      if (token !== aiQueryToken) return;
+      try { renderAiQuery(question); } finally {
+        result.removeAttribute("aria-busy");
+        if (submit) { submit.disabled = false; submit.textContent = submitLabel; }
+        $$(".topic-button").forEach(button => { button.disabled = false; });
+        aiQueryTimer = null;
+      }
+    }, 900);
   }
   const navIcons = {
     dashboard: '<svg viewBox="0 0 24 24"><rect x="3.5" y="3.5" width="7" height="7" rx="1.2"></rect><rect x="13.5" y="3.5" width="7" height="7" rx="1.2"></rect><rect x="3.5" y="13.5" width="7" height="7" rx="1.2"></rect><rect x="13.5" y="13.5" width="7" height="7" rx="1.2"></rect></svg>',
@@ -1187,10 +1312,11 @@
   }
   function modalShell() { return `<div class="modal-backdrop" id="modalBackdrop" aria-hidden="true"><section class="modal" role="dialog" aria-modal="true" aria-labelledby="modalTitle"><header class="modal-head"><h2 id="modalTitle"></h2><button class="modal-close" type="button" id="modalClose" data-action="close" aria-label="关闭对话框">×</button></header><div class="modal-body" id="modalBody"></div><footer class="modal-foot" id="modalFoot"></footer></section></div><div class="toast-region" id="toastRegion" role="status" aria-live="polite"></div>`; }
   function render() {
+    if (pageId === "ai-query") stopAiQuery();
     if (scope === "login") return renderLogin();
     const pageKey = pageId === "inspections" ? "safety" : pageId, nav = M.navigationFor(scope, actor.role), current = (M.navigation[scope] || []).flatMap(g => g.items).find(i => i.id === pageKey), defaultTitle = current?.label || "业务工作台", title = pageId === "dashboard" && actor.role === "teacher" ? "我的工作台" : defaultTitle;
     const data = ["dashboard", "ai-query"].includes(pageId) ? null : dataset();
-    const scopeContext = scope === "district" ? field("scopeSchool", "学校范围", view.school, "text", [["", "全部学校"], ...opts("schools", db.schools)], false, 'data-context="school"') : `<span class="scope-label">${h(name("schools", actor.school))} · ${h(M.roles[actor.role])}</span>`, termContext = referencePage() || pageId === "archives" ? "" : field("scopeTerm", "学期", view.term, "text", opts("terms", db.terms), true, 'data-context="term"'), context = scopeContext + termContext + subjectContextField();
+    const scopeContext = scope === "district" ? field("scopeSchool", "学校范围", view.school, "text", [["", "全部学校"], ...opts("schools", db.schools)], false, 'data-context="school"') : `<span class="scope-label">${h(name("schools", actor.school))} · ${h(M.roles[actor.role])}</span>`, termContext = referencePage() || pageId === "archives" || ["safety", "inspections"].includes(pageId) ? "" : field("scopeTerm", "学期", view.term, "text", opts("terms", db.terms), true, 'data-context="term"'), context = scopeContext + termContext + subjectContextField();
     document.title = `${title} | 实验教学设备管理平台`;
     const breadcrumbSubject = subjectContextEnabled() && !isAllSubject(view.subject) ? `<span> / </span>${h(subjectLabel(view.subject))}` : "";
     app.innerHTML = `<div class="app-shell"><aside class="rail"><a class="rail-brand" href="dashboard.html"><span class="brand-mark">实验</span><div><strong class="brand-title">实验教学设备管理平台</strong><small class="brand-subtitle">${scope === "district" ? "区域监管端" : actor.role === "teacher" ? "教师工作端" : "学校管理端"}</small></div></a><nav class="rail-nav" aria-label="主导航">${nav.map((g, index) => `<section class="nav-group" aria-labelledby="nav-group-${index}"><div class="nav-group-label" id="nav-group-${index}">${h(g.label)}</div>${g.items.map(i => `<a class="nav-link ${i.id === pageKey ? "active" : ""}" href="${i.href}" ${i.id === pageKey ? 'aria-current="page"' : ""}><span class="nav-mark" aria-hidden="true">${navIcon(i.id)}</span><span class="nav-text">${h(i.label)}</span></a>`).join("")}</section>`).join("")}</nav><footer class="rail-footer"><div class="identity-card"><span class="identity-avatar" aria-hidden="true">${h(actor.name.slice(0, 1))}</span><div><div class="identity-name">${h(actor.name)}</div><div class="identity-role">${h(M.roles[actor.role])}</div></div></div><div class="identity-role">${scope === "district" ? h(db.settings.authority) : h(name("schools", actor.school))}</div></footer></aside><main class="app-main"><header class="app-topbar"><div class="breadcrumb">${scope === "district" ? h(db.settings.region) : h(name("schools", actor.school))}${breadcrumbSubject}<span> / </span>${h(title)}</div><div class="topbar-actions">${button("系统控制", "demo-control")}</div></header>${persistenceError ? `<div class="storage-warning" role="alert">${h(persistenceError)}</div>` : ""}<div class="page"><header class="page-header"><div class="page-heading"><div class="page-heading-row"><h1 class="page-title">${h(title)}</h1><p class="page-kicker">${scope === "district" ? "区域监管" : actor.role === "teacher" ? "教师工作" : "学校管理"}</p></div><p class="page-description">${h(descriptions[pageId] || "")}</p></div>${data && data.table !== "settings" ? `<div class="page-actions">${actionsFor(data.table)}</div>` : ""}</header><div class="context-bar">${context}</div>${pageId === "dashboard" ? dashboard() : pageId === "ai-query" ? aiView() : listView(data)}<footer class="page-footnote">当前页面与各项统计共用同一套业务台账。设备、耗材和安全记录为当前台账；教学指标按所选学期统计。</footer></div></main></div>${modalShell()}`;
@@ -1215,9 +1341,15 @@
     if (action === "innovation-delete") return form("删除自定义创新实验", '<p class="full">仅可删除尚未编入实验计划且没有附件的自定义创新实验；删除不会影响设备或库存台账。</p>' + field("reason", "删除原因", "", "textarea", null, true, 'maxlength="100"'), "customExperiment.delete", { id, term: view.term }, "确认删除");
     if (action === "innovation-equipment-add") { if ($$('[data-innovation-row]').length >= 30) throw new Error("最多登记30项器材需求。"); $("#innovationEquipmentRows").insertAdjacentHTML("beforeend", innovationEquipmentRow()); return; }
     if (action === "innovation-equipment-remove") { if ($$('[data-innovation-row]').length === 1) throw new Error("至少保留一项器材需求。"); el.closest('[data-innovation-row]')?.remove(); return; }
-    if (action === "tab") { Object.assign(view, { tab: el.dataset.tab, page: 1, state: "", subject: subjectContextEnabled() ? view.subject : "", grade: "", category: "", itemId: "", keyword: "", classId: "", teacherId: "", roomId: "", endDate: "", ...(pageId === "booking" ? {} : { date: "" }) }); selected.clear(); render(); return; }
+    if (action === "tab") { Object.assign(view, { tab: el.dataset.tab, page: 1, state: "", subject: subjectContextEnabled() ? view.subject : "", grade: "", category: "", itemId: "", keyword: "", classId: "", teacherId: "", roomId: "", endDate: "", batchMode: false, todoType: "", ...(pageId === "booking" ? {} : { date: "" }) }); selected.clear(); render(); return; }
+    if (action === "todo-filter") { view.todoType = el.dataset.todoType || ""; view.page = 1; selected.clear(); render(); return; }
+    if (action === "batch-start") { view.batchMode = true; selected.clear(); render(); return; }
+    if (action === "batch-cancel") { view.batchMode = false; selected.clear(); render(); return; }
+    if (action === "batch-export") return exportList("selected");
+    if (action === "export-all") return exportList("all");
+    if (action === "safety-more") return safetyMoreActions(table, id);
     if (action === "page-prev" || action === "page-next") { view.page += action === "page-prev" ? -1 : 1; render(); return; }
-    if (action === "filter-reset") { Object.assign(view, { keyword: "", state: "", subject: subjectContextEnabled() ? view.subject : "", grade: "", category: "", itemId: "", classId: "", teacherId: "", roomId: "", date: "", endDate: "", year: M.TODAY.slice(0, 4), page: 1 }); selected.clear(); render(); return; }
+    if (action === "filter-reset") { Object.assign(view, { keyword: "", state: "", subject: subjectContextEnabled() ? view.subject : "", grade: "", category: "", itemId: "", classId: "", teacherId: "", roomId: "", date: "", endDate: "", year: M.TODAY.slice(0, 4), page: 1, todoType: "" }); selected.clear(); render(); return; }
     if (action === "date" || action === "all-dates") { view.date = el.dataset.date || ""; view.page = 1; selected.clear(); render(); return; }
     if (["week-prev", "week-next", "today"].includes(action)) { view.week = action === "today" ? M.TODAY : addDays(view.week, action === "week-prev" ? -7 : 7); view.date = ""; view.page = 1; render(); return; }
     if (action === "purchase-new" || action === "receipt") return purchaseForm(action === "receipt", id);
@@ -1234,6 +1366,7 @@
     if (action === "booking-new") return bookingForm(table === "teachingTasks" ? id : "");
     if (action === "plan-new") return planForm();
     if (action === "check-new") return checkForm(table === "tasks" ? id : "");
+    if (action === "hazard-rectify") return hazardRectificationForm(id);
     if (action === "arrangement-edit") return arrangementForm(table === "arrangements" ? get("arrangements", id)?.bookingId : id, el.dataset.arrangementId || (table === "arrangements" ? id : ""));
     if (["asset-report", "teaching-report", "risk-report"].includes(action)) return showReport(action);
     if (action === "cabinet-card") return cabinetCard(id);
@@ -1249,6 +1382,7 @@
     if (action === "import-example") { $("#f-source").value = M.csv([M.importHeader, ["202020002", "力学轨道小车", "J2101", "物理仪器", "台", "单件设备", "是", 2, 680, "A202", "P01", "2027-02-28", ""]]); importResult = null; $("#importPreview").textContent = "内容已填入，请校验预览。"; return; }
     if (action === "import-preview") { importResult = null; const source = $("#f-source").value, result = M.validateImport(source, db, actor.school), rows = result.items.map(row => ({ ...row, trackingText: row.trackingMode === "SERIALIZED" ? "单件设备" : "数量库存", maintenanceText: row.maintenanceRequired ? "是" : "否", room: row.roomId ? `${get("rooms", row.roomId)?.roomNo || ""}${row.cabinetId ? ` / ${get("cabinets", row.cabinetId)?.code || ""}` : ""}` : "待分配", nextMaintenance: row.nextMaintenance || "不适用", expiry: row.expiry || "不适用" })); $("#importPreview").innerHTML = result.errors.length ? `<p class="form-error">${result.errors.map(h).join("<br>")}</p>` : `<p class="success-copy">校验通过：${result.items.length}条明细，共${result.items.reduce((n, item) => n + item.qty, 0)}件。存放位置留空时进入待存放或待分配。</p>${miniTable(col("classificationCode:分类编号|name:物品名称|spec:规格型号|category:分类|unit:单位|trackingText:管理方式|maintenanceText:需要周期维保|qty:数量|price:单价（元）|room:存放位置（房间／橱柜）|nextMaintenance:下次维保日期|expiry:有效期"), rows)}`; if (!result.errors.length) importResult = { source }; return; }
     if (action === "attachment") return attachmentForm(table, id);
+    if (action === "rectification-example") { const row = get("hazards", id || $("#modalForm")?.dataset.id); const hazard = row || records("hazards").find(item => ["待整改", "整改中"].includes(item.state)); if (!hazard) throw new Error("隐患记录已变更，请重新打开办理窗口。"); pendingFile = null; $("#attachmentFile").value = ""; $("#f-name").value = `危化品整改核对记录-${hazard.id}.txt`; $("#f-content").value = `整改对象：${M.safetyTargetLabel(db, hazard)}\n隐患问题：${hazard.title}\n整改措施：请补充实际整改措施\n现场核对：包装、标签、数量、存放条件和有效期已核对\n完成日期：${M.TODAY}\n核对人：${actor.name}`; $("#fileStatus").textContent = "已生成TXT核对记录，请按现场实际情况修改后提交。"; return; }
     if (action === "attachment-example") { const [t, key] = $("#f-related").value.split("|"), r = get(t, key); pendingFile = null; $("#attachmentFile").value = ""; $("#f-name").value = `${M.tableNames[t]}-${key}-业务说明.txt`; $("#f-content").value = `业务说明材料\n关联业务：${M.tableNames[t]} ${key}\n学校：${name("schools", r.school)}\n统计日期：${M.TODAY}\n当前状态：${r.state || r.result || "已登记"}\n说明：${t === "hazards" ? "已完成整改和现场检查，申请校内复核。" : r.title || r.name || "用于记录资料关联与业务处理。"}\n请根据当前业务补充说明。`; $("#fileStatus").textContent = "已生成TXT内容；可修改后保存。"; return; }
     if (action === "ask-example") { $("#askForm [name=question]").value = el.dataset.question; return ask(el.dataset.question); }
     if (action === "submission") return form("上报本学期台账快照", `<p class="full">保存${h(name("schools", actor.school))}在${h(name("terms", view.term))}的当前指标快照（版本${db.revision}）。区级“学校与上报”可查看，后续修改不覆盖本次快照。</p>`, "submission.create", { term: view.term }, "确认上报");

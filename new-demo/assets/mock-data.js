@@ -499,7 +499,7 @@
     db.schools.forEach((school, index) => {
       ["教务处", "理科教研组", "实验中心"].forEach((name, n) => db.departments.push({ id: `${school.id}-D${n + 1}`, school: school.id, name, state: "启用" }));
       db.terms.forEach(term => defaultPeriods.forEach(([number, start, end]) => db.periods.push({ id: term.id === "TERM26" ? `${school.id}-K${number}` : `${school.id}-${term.id}-K${number}`, school: school.id, term: term.id, number, name: `第${number}节`, start, end, state: "启用" })));
-      ["admin", "teacher", "teacher", "teacher", "teacher", "teacher", "teacher", "teacher", "teacher", "teacher", "teacher", "teacher", "teacher", "teacher", "admin"].forEach((role, n) => db.staff.push({ id: `${school.id}-T${n}`, school: school.id, name: names[index][n], role, subject: ["综合", "物理", "化学", "生物", "科学", "物理", "化学", "生物", "科学", "物理", "化学", "生物", "科学", "物理", "综合"][n], departmentId: `${school.id}-D${n === 0 ? 1 : n === 14 ? 3 : 2}`, title: n === 0 || n === 14 ? "实验管理员" : "一级教师", phone: `138****${1100 + index * 20 + n}`, enabled: n === 0 || index === 0 && n === 1, qualification: n === 0 || n === 14 ? "实验室管理资质" : "教师资格证", sex: n % 2 ? "男" : "女", ...((n === 14 || n === 4) ? { legacyRole: "technician" } : {}) }));
+      ["admin", "teacher", "teacher", "teacher", "teacher", "teacher", "teacher", "teacher", "teacher", "teacher", "teacher", "teacher", "teacher", "teacher", "admin"].forEach((role, n) => db.staff.push({ id: `${school.id}-T${n}`, school: school.id, name: names[index][n], role, subject: ["综合", "物理", "化学", "生物", "科学", "物理", "化学", "生物", "科学", "物理", "化学", "生物", "科学", "物理", "综合"][n], departmentId: `${school.id}-D${n === 0 ? 1 : n === 14 ? 3 : 2}`, title: n === 0 || n === 14 ? "实验管理员" : "一级教师", phone: `138****${1100 + index * 20 + n}`, enabled: n === 0 || n === 14 || index === 0 && n === 1, qualification: n === 0 || n === 14 ? "实验室管理资质" : "教师资格证", sex: n % 2 ? "男" : "女", ...((n === 14 || n === 4) ? { legacyRole: "technician" } : {}) }));
       [["L1", "物理实验室 1", "A201", "教学实验室", "物理", 96, 48], ["L2", "化学实验室 1", "B201", "教学实验室", "化学", 96, 48], ["L3", "生物学实验室 1", "C201", "教学实验室", "生物", 96, 48], ["L4", "科学探究实验室 1", "D201", "教学实验室", "科学", 96, 48], ["R4", "物理仪器室", "A202", "仪器室", "物理", 48, null]].forEach(([suffix, name, roomNo, type, subject, area, seats]) => { db.rooms.push({ id: `${school.id}-${suffix}`, school: school.id, name, roomNo, type, subject, area, seats, builtAt: "2023-08-20", builder: "", stage: school.stage, features: subject === "化学" ? "通风设施、洗眼器、灭火器" : "电源保护、灭火器", hazardStorage: subject === "化学", note: "", state: "可用" }); });
       [["L1", "G01", "光学仪器柜", "仪器柜", false], ["L2", "H01", "化学品专用柜", "危化品专用柜", true], ["L3", "S01", "生物观察柜", "仪器柜", false], ["R4", "P01", "物理器材柜", "耗材柜", false]].forEach(([roomSuffix, code, name, type, hazardStorage]) => db.cabinets.push({ id: `${school.id}-CAB-${code}`, school: school.id, roomId: `${school.id}-${roomSuffix}`, code, name, type, state: "启用", custodianId: `${school.id}-T0`, hazardStorage, note: "演示柜位" }));
       let classIndex = 1;
@@ -1392,6 +1392,21 @@
     else if (command === "check.delete") { permit(["admin"]); const row = get("checks"); must(!db.hazards.some(hazard => hazard.checkId === row.id) && !hasArchive("checks", row.id), "检查记录已有隐患或附件，不能删除。"); if (row.taskId) { const task = find(db, "tasks", row.taskId); task.state = "待检查"; delete task.checkId; log("tasks", task, "删除检查记录后恢复待检查", row.id); } remove("checks", row, "删除检查记录", text(p.reason, "删除原因", 100)); }
     else if (command === "hazard.update") { permit(["admin"]); const row = get("hazards"); state(row, ["待整改", "整改中"]); row.title = text(p.title, "隐患描述"); row.owner = text(p.owner, "责任人"); row.level = choice(p.level, ["一般关注", "需优先处理"], "优先级"); row.due = date(p.due); must(row.due >= row.date, "整改期限不能早于检查日期。"); row.note = optional(p.note, "说明", 500); log("hazards", row, "修改隐患信息"); }
     else if (command === "hazard.delete") { permit(["admin"]); const row = get("hazards"); state(row, ["待整改"]); must(!row.attachmentId && !hasArchive("hazards", row.id), "隐患已有整改附件，不能删除。"); const check = find(db, "checks", row.checkId); remove("hazards", row, "删除隐患记录", text(p.reason, "删除原因", 100)); if (!db.hazards.some(hazard => hazard.checkId === check.id)) { check.result = "正常"; log("checks", check, "删除隐患后更正检查结果为正常", row.id); if (check.taskId) { const task = find(db, "tasks", check.taskId); task.state = "已完成"; log("tasks", task, "删除隐患后完成检查", row.id); } } result = row; }
+    else if (command === "hazard.rectify") {
+      permit(["admin"]);
+      const row = get("hazards"); state(row, ["待整改", "整改中"]);
+      const rectification = text(p.reason, "整改说明"), source = p.attachment || {}, fileName = text(source.name, "整改材料文件名"), content = String(source.content || ""), dataUrl = String(source.dataUrl || "");
+      must(!/\.(html?|svg|js|exe|sh)$/i.test(fileName), "不接受可执行文件、HTML或SVG附件。");
+      must(content || /^data:[\w.+/-]+;base64,[A-Za-z0-9+/=]+$/.test(dataUrl), "请上传整改材料或填写文本内容。");
+      must(content.length + dataUrl.length <= 750000, "单个整改材料限512KB左右。");
+      const file = add("archives", { id: id("FILE"), school: actor.school, name: fileName, category: "安全管理", relatedTable: "hazards", relatedId: row.id, attachmentType: "RECTIFICATION", date: TODAY, uploader: actor.name, state: "已归档", mime: String(source.mime || "text/plain;charset=utf-8"), content, dataUrl }, "提交隐患整改材料");
+      Object.assign(row, { rectification, attachmentId: file.id, submitterId: actor.id, submitterName: actor.name, submittedAt: now, state: "待校内复核" });
+      row.submissionHistory ||= [];
+      row.submissionHistory.push({ submitterId: actor.id, submitterName: actor.name, at: now, rectification, attachmentId: file.id });
+      syncSafetyTask(db, find(db, "checks", row.checkId));
+      log("hazards", row, "提交校内复核", rectification);
+      result = row;
+    }
     else if (command === "hazard.submit") {
       permit(["admin"]);
       const row = get("hazards"); state(row, ["待整改", "整改中"]);
@@ -1406,6 +1421,7 @@
     else if (command === "hazard.schoolReview") {
       permit(["admin"]);
       const row = get("hazards"); state(row, ["待校内复核"]);
+      must(row.submitterId !== actor.id, "不能复核本人提交的整改，请由另一名管理员确认。");
       const approve = p.approve === true, review = text(p.reason, "校内复核意见");
       row.reviewHistory ||= [];
       row.reviewHistory.push({ stage: "school", approve, result: approve ? "通过" : "驳回", reason: review, reviewerId: actor.id, reviewerName: actor.name, at: now });

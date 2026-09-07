@@ -966,6 +966,26 @@ a {
   color: var(--danger);
 }
 
+.safety-overview button.summary-item {
+  display: grid;
+  justify-items: start;
+  border-top: 0;
+  border-bottom: 0;
+  border-left: 0;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+
+.safety-overview button.summary-item:hover,
+.safety-overview button.summary-item.active {
+  background: var(--surface-muted);
+}
+
+.safety-overview button.summary-item.active {
+  box-shadow: inset 0 -2px var(--accent);
+}
+
 .safety-overview-note {
   margin-top: 13px;
 }
@@ -1522,6 +1542,39 @@ a {
   align-items: center;
   gap: 4px;
   color: var(--muted);
+}
+
+.query-loading {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 24px;
+  padding: 18px 16px;
+  border-top: 1px solid var(--line);
+  color: var(--ink-soft);
+}
+
+.query-loading strong {
+  display: block;
+  font-size: 12px;
+}
+
+.query-loading .help {
+  margin: 4px 0 0;
+}
+
+.query-loading-spinner {
+  flex: 0 0 18px;
+  width: 18px;
+  height: 18px;
+  border: 2px solid var(--line);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: query-spin 800ms linear infinite;
+}
+
+@keyframes query-spin {
+  to { transform: rotate(360deg); }
 }
 
 .typing-dot {
@@ -2564,6 +2617,20 @@ body[data-page="booking"] .row-actions { min-width: 180px; }
 .legend-dot.cancelled { background: #d64545; }
 .row-actions .button { min-height: 30px; padding: 0 9px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface-raised); color: var(--ink-soft); font-size: 10px; font-weight: 680; }
 .row-actions .button:hover { border-color: var(--line-strong); color: var(--ink); }
+.table-record-link { display: grid; gap: 3px; max-width: 250px; padding: 0; border: 0; background: transparent; color: var(--ink); text-align: left; cursor: pointer; }
+.table-record-link strong { font-size: 12px; line-height: 1.45; }
+.table-record-link small { color: var(--muted); font-family: var(--mono); font-size: 10px; font-weight: 500; }
+.table-record-link:hover strong { color: var(--accent); text-decoration: underline; text-underline-offset: 3px; }
+.row-action-note { display: inline-flex; align-items: center; min-height: 30px; max-width: 150px; color: var(--muted); font-size: 10px; line-height: 1.4; white-space: normal; }
+.batch-toolbar, .active-filter { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 12px; border-top: 1px solid var(--line); background: var(--accent-soft); color: var(--ink-soft); font-size: 11px; }
+.active-filter { justify-content: flex-start; background: var(--surface-muted); }
+.more-action-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+.more-action-list .button { justify-content: flex-start; min-height: 40px; }
+.rectification-context { padding: 12px 14px; border-left: 3px solid var(--warning); border-radius: var(--radius-control); background: var(--warning-soft); }
+body[data-page="safety"] .row-actions,
+body[data-page="inspections"] .row-actions { min-width: 108px; max-width: 180px; }
+body[data-page="safety"] .data-table,
+body[data-page="inspections"] .data-table { min-width: 820px; }
 .pagination { align-items: center; }
 .pagination .button { min-height: 31px; padding: 0 7px; border-color: var(--line); border-radius: 8px; font-size: 10px; }
 .empty-message { padding: 28px 14px; color: var(--muted); font-size: 13px; line-height: 1.8; }
